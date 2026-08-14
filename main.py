@@ -380,6 +380,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_time = asyncio.get_event_loop().time()
     usage = {}
 
+    # Фоновая задача для обновления таймера каждые 2 секунды
+    stop_timer = asyncio.Event()
+    last_timer_text = ""
+
+    async def timer_updater():
+        nonlocal last_timer_text
+        while not stop_timer.is_set():
+            await asyncio.sleep(2)
+            if stop_timer.is_set():
+                break
+            elapsed = int(asyncio.get_event_loop().time() - start_time)
+            preview = "".join(all_parts)[-2500:] if all_parts else ""
+            timer_text = (
+                f"{emoji('thinking')} <b>Обрабатываю...</b> ⏱ <i>{elapsed}с</i> ({provider_name})\n\n"
+                f"<blockquote expandable>{preview}</blockquote>"
+            )
+            if timer_text != last_timer_text:
+                try:
+                    await thinking_msg.edit_text(timer_text, parse_mode=ParseMode.HTML)
+                    last_timer_text = timer_text
+                except Exception:
+                    pass
+
+    timer_task = asyncio.create_task(timer_updater())
+
     try:
         async for token, u in call_provider_api(provider_key, model_id, messages):
             all_parts.append(token)
@@ -387,7 +412,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if u:
                 usage = u
 
-            # Обновляем каждые ~300 символов + таймер
+            # Обновляем каждые ~300 символов (плюс таймер обновляется отдельно)
             elapsed = int(asyncio.get_event_loop().time() - start_time)
             if len(full_text) - last_edit_len >= 300:
                 last_edit_len = len(full_text)
@@ -408,7 +433,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Попробуйте позже или смените модель через /menu.",
             parse_mode=ParseMode.HTML
         )
+        stop_timer.set()
+        await timer_task
         return
+    finally:
+        stop_timer.set()
+        await timer_task
 
     full_text = "".join(all_parts).strip()
     elapsed = int(asyncio.get_event_loop().time() - start_time)
