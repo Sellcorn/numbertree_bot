@@ -29,17 +29,6 @@ MAX_HISTORY_GROUP = 3      # группы: короткая память на п
 
 # Настройки провайдеров и моделей
 PROVIDERS = {
-    "nvidia": {
-        "name": "NVIDIA",
-        "api_key": os.getenv("NVIDIA_API_KEY"),
-        "api_url": "https://integrate.api.nvidia.com/v1/chat/completions",
-        "models": {
-            "deepseek-v4-flash": "deepseek-ai/deepseek-v4-flash-0731",
-            "nemotron-70b": "nvidia/llama-3.1-nemotron-70b-instruct",
-            "llama-8b": "meta/llama-3.1-8b-instruct",
-        },
-        "default": "deepseek-v4-flash",
-    },
     "groq": {
         "name": "Groq",
         "api_key": os.getenv("GROQ_API_KEY"),
@@ -52,11 +41,20 @@ PROVIDERS = {
         },
         "default": "llama-3.3-70b",
     },
+    "nvidia": {
+        "name": "NVIDIA",
+        "api_key": os.getenv("NVIDIA_API_KEY"),
+        "api_url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "models": {
+            "deepseek-v4-flash": "deepseek-ai/deepseek-v4-flash-0731",
+        },
+        "default": "deepseek-v4-flash",
+    },
 }
 
 # Пользовательские настройки: chat_id -> {provider, model}
 USER_SETTINGS = {}
-DEFAULT_PROVIDER = "nvidia"
+DEFAULT_PROVIDER = "groq"
 
 # Хранилище сообщений чатов для /summary, /judge, /context
 # chat_id -> список сообщений [{user, text, time, user_name}]
