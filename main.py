@@ -756,9 +756,12 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик нажатий на инлайн-кнопки."""
     query = update.callback_query
-    await query.answer()
     chat_id = query.message.chat_id
     data = query.data
+    
+    # Быстрые переходы меню — отвечаем сразу
+    if data in ("main_menu", "models_menu", "quiz_menu", "poll_menu", "code_help", "code_tasks"):
+        await query.answer()
     
     if data == "main_menu":
         await query.edit_message_text(
@@ -777,6 +780,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if provider_key in PROVIDERS:
             set_user_provider(chat_id, provider_key)
             provider_name = PROVIDERS[provider_key]["name"]
+            await query.answer()
             await query.edit_message_text(
                 f"{emoji('check')} Провайдер изменён на <b>{provider_name}</b>\n\nВыберите модель:",
                 parse_mode=ParseMode.HTML,
@@ -789,6 +793,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Проверяем что модель существует у текущего провайдера
         if model_key in PROVIDERS[provider_key]["models"]:
             set_user_model(chat_id, model_key)
+            await query.answer()
             await query.edit_message_text(
                 f"{emoji('check')} Модель изменена на <b>{model_key}</b>",
                 parse_mode=ParseMode.HTML,
@@ -797,24 +802,28 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await query.answer(f"Модель {model_key} недоступна для этого провайдера", show_alert=True)
     elif data == "quiz_menu":
+        await query.answer()
         await query.edit_message_text(
             f"{emoji('brain')} <b>Викторина</b>\n\nВыберите тему:",
             parse_mode=ParseMode.HTML,
             reply_markup=build_quiz_menu(chat_id)
         )
     elif data == "poll_menu":
+        await query.answer()
         await query.edit_message_text(
             f"{emoji('code')} <b>Умные опросы</b>\n\nВыберите тип:",
             parse_mode=ParseMode.HTML,
             reply_markup=build_poll_menu(chat_id)
         )
     elif data == "code_help":
+        await query.answer()
         await query.edit_message_text(
             f"{emoji('code')} <b>Помощь с кодом</b>\n\nВыберите действие:",
             parse_mode=ParseMode.HTML,
             reply_markup=build_code_help_menu(chat_id)
         )
     elif data == "code_tasks":
+        await query.answer()
         await query.edit_message_text(
             f"{emoji('brain')} <b>Задачи по программированию</b>\n\nВыберите уровень:",
             parse_mode=ParseMode.HTML,
@@ -822,11 +831,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif data.startswith("quiz:"):
         topic = data.split(":")[1]
-        await query.answer()
         await _run_quiz(chat_id, context, topic)
     elif data.startswith("poll:"):
         poll_type = data.split(":")[1]
-        await query.answer()
         await _run_poll(chat_id, context, poll_type)
     elif data.startswith("code:"):
         action = data.split(":")[1]
@@ -839,7 +846,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif data.startswith("task:"):
         difficulty = data.split(":")[1]
-        await query.answer()
         await _run_task(chat_id, context, difficulty)
 
 
