@@ -97,51 +97,81 @@ def should_respond(update: Update) -> bool:
 
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-MODEL = "deepseek-ai/deepseek-v4-flash-0731"
 
 if not NVIDIA_API_KEY:
     raise ValueError("Установите переменную окружения NVIDIA_API_KEY")
 
 
 async def call_nvidia_api(messages: list[dict], stream: bool = True) -> AsyncGenerator[tuple[str, dict], None]:
-    """Yields (content_token, usage_dict). usage_dict is empty until final chunk."""
+    """Yields (content_token, usage_dict). usage_dict is empty until final chunk.
+    Retries on 429/529/503 with exponential backoff. Falls back to alternative model."""
     headers = {
         "Authorization": f"Bearer {NVIDIA_API_KEY}",
         "Content-Type": "application/json",
     }
-    payload = {
-        "model": MODEL,
-        "messages": messages,
-        "stream": stream,
-        "temperature": 0.6,
-        "max_tokens": 4096,
-    }
-
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        async with client.stream("POST", NVIDIA_API_URL, headers=headers, json=payload) as response:
-            if response.status_code != 200:
-                error_text = await response.aread()
-                logger.error(f"NVIDIA API error {response.status_code}: {error_text}")
-                raise httpx.HTTPStatusError(f"NVIDIA API error: {response.status_code}", request=response.request, response=response)
-            
-            usage = {}
-            async for line in response.aiter_lines():
-                if line.startswith("data: "):
-                    data = line[6:]
-                    if data == "[DONE]":
-                        break
-                    try:
-                        import json
-                        chunk = json.loads(data)
-                        delta = chunk.get("choices", [{}])[0].get("delta", {})
-                        content = delta.get("content", "")
-                        # usage приходит в последнем чанке
-                        if "usage" in chunk:
-                            usage = chunk["usage"]
-                        if content:
-                            yield content, usage
-                    except json.JSONDecodeError:
-                        continue
+    
+    # Основная модель + фоллбеки
+    models = [
+        "deepseek-ai/deepseek-v4-flash-0731",  # основная
+        "nvidia/llama-3.1-nemotron-70b-instruct",  # фоллбек 1
+        "meta/llama-3.1-8b-instruct",  # фоллбек 2 (быстрая)
+    ]
+    
+    for attempt, model in enumerate(models):
+        payload = {
+            "model": model,
+            "messages": messages,
+            "stream": stream,
+            "temperature": 0.6,
+            "max_tokens": 4096,
+        }
+        
+        max_retries = 3 if attempt == 0 else 2
+        base_delay = 1.5
+        
+        for retry in range(max_retries):
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    async with client.stream("POST", NVIDIA_API_URL, headers=headers, json=payload) as response:
+                        if response.status_code in (429, 529, 503):
+                            delay = base_delay * (2 ** retry)
+                            logger.warning(f"Model {model} rate limited ({response.status_code}), retry {retry+1}/{max_retries} in {delay}s")
+                            await asyncio.sleep(delay)
+                            continue
+                        
+                        if response.status_code != 200:
+                            error_text = await response.aread()
+                            logger.error(f"NVIDIA API error {response.status_code} on {model}: {error_text}")
+                            break  # пробуем следующую модель
+                        
+                        usage = {}
+                        async for line in response.aiter_lines():
+                            if line.startswith("data: "):
+                                data = line[6:]
+                                if data == "[DONE]":
+                                    return
+                                try:
+                                    import json
+                                    chunk = json.loads(data)
+                                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                                    content = delta.get("content", "")
+                                    if "usage" in chunk:
+                                        usage = chunk["usage"]
+                                    if content:
+                                        yield content, usage
+                                except json.JSONDecodeError:
+                                    continue
+                        return  # успех
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                delay = base_delay * (2 ** retry)
+                logger.warning(f"Network error on {model}: {e}, retry {retry+1}/{max_retries} in {delay}s")
+                await asyncio.sleep(delay)
+                continue
+        
+        logger.warning(f"Model {model} failed after {max_retries} retries, trying next model")
+    
+    # Все модели провалились
+    raise RuntimeError("All NVIDIA models unavailable")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
