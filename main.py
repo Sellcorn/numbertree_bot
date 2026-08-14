@@ -21,9 +21,10 @@ logger = logging.getLogger(__name__)
 
 BOT_USERNAME = None
 
-# Хранилище контекста диалогов: chat_id -> список сообщений
+# Хранилище контекста диалогов
 CONVERSATION_HISTORY = {}
-MAX_HISTORY = 10  # сколько пар запрос-ответ запоминаем
+MAX_HISTORY_PRIVATE = 10   # личка: полная память
+MAX_HISTORY_GROUP = 3      # группы: короткая память на пользователя
 
 # ============ CUSTOM EMOJI CONFIG ============
 # Получите custom_emoji_id из пака https://t.me/addemoji/GameEmoji
@@ -156,10 +157,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
-    if chat_id in CONVERSATION_HISTORY:
-        del CONVERSATION_HISTORY[chat_id]
+    user_id = update.message.from_user.id
+    is_private = update.message.chat.type == "private"
+    history_key = chat_id if is_private else f"{chat_id}:{user_id}"
+
+    if history_key in CONVERSATION_HISTORY:
+        del CONVERSATION_HISTORY[history_key]
+    scope = "чата" if is_private else "вашей истории в этом чате"
     await update.message.reply_text(
-        f"{emoji('check')} <b>История диалога очищена</b>",
+        f"{emoji('check')} <b>История {scope} очищена</b>",
         parse_mode=ParseMode.HTML
     )
 
@@ -179,9 +185,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_text = user_text.replace(f"@{BOT_USERNAME}", "").strip()
 
     chat_id = update.message.chat_id
+    user_id = update.message.from_user.id
+    is_private = update.message.chat.type == "private"
+
+    # Ключ истории: личка = chat_id, группа = chat_id:user_id
+    history_key = chat_id if is_private else f"{chat_id}:{user_id}"
+    max_history = MAX_HISTORY_PRIVATE if is_private else MAX_HISTORY_GROUP
 
     # Получаем историю диалога
-    history = CONVERSATION_HISTORY.get(chat_id, [])
+    history = CONVERSATION_HISTORY.get(history_key, [])
 
     # Начальное сообщение с анимированным эмодзи
     thinking_msg = await update.message.reply_text(
@@ -236,9 +248,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Сохраняем в историю
     history.append({"user": user_text, "assistant": full_text})
-    if len(history) > MAX_HISTORY:
+    if len(history) > max_history:
         history.pop(0)
-    CONVERSATION_HISTORY[chat_id] = history
+    CONVERSATION_HISTORY[history_key] = history
 
     # Информация о токенах
     token_info = ""
