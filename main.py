@@ -8,7 +8,7 @@ import httpx
 import markdown
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ChatMemberHandler
 from telegram.constants import ParseMode
 
 load_dotenv()
@@ -255,6 +255,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Приветствует новых участников в группе с кнопками меню."""
+    if update.message and update.message.new_chat_members:
+        for member in update.message.new_chat_members:
+            if member.id == BOT_USERNAME:
+                continue  # Не приветствуем самого бота
+            await update.message.reply_text(
+                f"{emoji('rocket')} <b>Привет, {member.mention_html()}!</b>\n\n"
+                f"{emoji('brain')} Я ИИ-ассистент с выбором моделей (NVIDIA / Groq).\n"
+                f"{emoji('gear')} Отвечаю по @username или reply.\n\n"
+                f"Выберите модель и провайдера:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_main_menu(update.message.chat_id)
+            )
+
+
 async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     user_id = update.message.from_user.id
@@ -498,6 +514,7 @@ def main():
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
 
     import asyncio
     try:
