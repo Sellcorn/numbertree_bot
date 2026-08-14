@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import re
+from datetime import datetime
 from typing import AsyncGenerator
 
 import httpx
@@ -56,6 +57,11 @@ PROVIDERS = {
 # Пользовательские настройки: chat_id -> {provider, model}
 USER_SETTINGS = {}
 DEFAULT_PROVIDER = "nvidia"
+
+# Хранилище сообщений чатов для /summary, /judge, /context
+# chat_id -> список сообщений [{user, text, time, user_name}]
+CHAT_MESSAGES = {}
+MAX_CHAT_MESSAGES = 100  # максимум сообщений на чат
 
 # ============ CUSTOM EMOJI CONFIG ============
 # Получите custom_emoji_id из пака https://t.me/addemoji/GameEmoji
@@ -286,6 +292,123 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def context_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает последние сообщения чата: /context [N]"""
+    if update.message.chat.type not in ("group", "supergroup"):
+        await update.message.reply_text(f"{emoji('warning')} Команда работает только в группах")
+        return
+    
+    chat_id = update.message.chat_id
+    messages = CHAT_MESSAGES.get(chat_id, [])
+    if not messages:
+        await update.message.reply_text(f"{emoji('warning')} Нет сохранённых сообщений")
+        return
+    
+    n = 20
+    if context.args:
+        try:
+            n = max(1, min(50, int(context.args[0])))
+        except ValueError:
+            pass
+    
+    recent = messages[-n:]
+    lines = [f"{emoji('code')} <b>Последние {len(recent)} сообщений:</b>\n"]
+    for msg in recent:
+        time_str = msg["time"][11:16]
+        lines.append(f"<code>{time_str}</code> <b>{msg['user_name']}</b>: {msg['text'][:200]}")
+    
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Резюмирует последние сообщения: /summary [N]"""
+    if update.message.chat.type not in ("group", "supergroup"):
+        await update.message.reply_text(f"{emoji('warning')} Команда работает только в группах")
+        return
+    
+    chat_id = update.message.chat_id
+    messages = CHAT_MESSAGES.get(chat_id, [])
+    if not messages:
+        await update.message.reply_text(f"{emoji('warning')} Нет сохранённых сообщений для резюме")
+        return
+    
+    n = 30
+    if context.args:
+        try:
+            n = max(1, min(50, int(context.args[0])))
+        except ValueError:
+            pass
+    
+    recent = messages[-n:]
+    dialog = "\n".join([f"{msg['user_name']}: {msg['text']}" for msg in recent])
+    
+    provider_key, model_id = get_current_model(update.message.chat_id)
+    
+    prompt = (
+        f"Сделай краткое резюме диалога на русском языке. "
+        f"Выдели главные темы, споры, решения. Формат: кратко, по пунктам, без воды.\n\n"
+        f"Диалог:\n{dialog}"
+    )
+    
+    thinking = await update.message.reply_text(f"{emoji('thinking')} <b>Анализирую чат...</b>", parse_mode=ParseMode.HTML)
+    
+    try:
+        summary_parts = []
+        async for token, _ in call_provider_api(provider_key, model_id, [{"role": "user", "content": prompt}]):
+            summary_parts.append(token)
+        summary = "".join(summary_parts).strip()
+        
+        await thinking.edit_text(
+            f"{emoji('brain')} <b>Резюме последних {len(recent)} сообщений:</b>\n\n"
+            f"{md_to_html(summary)}",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        await thinking.edit_text(f"{emoji('error')} Ошибка: {e}")
+
+
+async def judge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Даёт мнение по спору: /judge [вопрос] или реплай на спор"""
+    if update.message.chat.type not in ("group", "supergroup"):
+        await update.message.reply_text(f"{emoji('warning')} Команда работает только в группах")
+        return
+    
+    chat_id = update.message.chat_id
+    messages = CHAT_MESSAGES.get(chat_id, [])
+    if not messages:
+        await update.message.reply_text(f"{emoji('warning')} Нет сохранённых сообщений")
+        return
+    
+    question = " ".join(context.args) if context.args else "Кто прав в этом споре? Дай объективное мнение."
+    
+    recent = messages[-20:]
+    dialog = "\n".join([f"{msg['user_name']}: {msg['text']}" for msg in recent])
+    
+    provider_key, model_id = get_current_model(chat_id)
+    
+    prompt = (
+        f"Проанализируй диалог и дай объективное мнение по вопросу: {question}\n"
+        f"Будь беспристрастным, опирайся только на факты из чата. Ответ на русском, кратко.\n\n"
+        f"Контекст:\n{dialog}"
+    )
+    
+    thinking = await update.message.reply_text(f"{emoji('brain')} <b>Анализирую спор...</b>", parse_mode=ParseMode.HTML)
+    
+    try:
+        opinion_parts = []
+        async for token, _ in call_provider_api(provider_key, model_id, [{"role": "user", "content": prompt}]):
+            opinion_parts.append(token)
+        opinion = "".join(opinion_parts).strip()
+        
+        await thinking.edit_text(
+            f"{emoji('brain')} <b>Мнение по спору:</b>\n\n"
+            f"{md_to_html(opinion)}",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        await thinking.edit_text(f"{emoji('error')} Ошибка: {e}")
+
+
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает главное меню выбора провайдера/модели."""
     chat_id = update.message.chat_id
@@ -350,6 +473,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Сохраняем сообщения групп для /summary, /judge, /context
+    if update.message and update.message.text and update.message.chat.type in ("group", "supergroup"):
+        chat_id = update.message.chat_id
+        user = update.message.from_user
+        CHAT_MESSAGES.setdefault(chat_id, []).append({
+            "user_id": user.id,
+            "user_name": user.first_name or user.username or str(user.id),
+            "text": update.message.text,
+            "time": datetime.now().isoformat()
+        })
+        # Ограничиваем размер
+        if len(CHAT_MESSAGES[chat_id]) > MAX_CHAT_MESSAGES:
+            CHAT_MESSAGES[chat_id] = CHAT_MESSAGES[chat_id][-MAX_CHAT_MESSAGES:]
+
     if not should_respond(update):
         return
 
@@ -512,6 +649,9 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear_history))
     app.add_handler(CommandHandler("menu", menu_command))
+    app.add_handler(CommandHandler("context", context_command))
+    app.add_handler(CommandHandler("summary", summary_command))
+    app.add_handler(CommandHandler("judge", judge_command))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
