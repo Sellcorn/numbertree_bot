@@ -167,7 +167,7 @@ def get_current_model(chat_id: int) -> tuple[str, str]:
 
 # Inline клавиатуры для меню
 def build_main_menu(chat_id: int):
-    """Главное меню: выбор провайдера."""
+    """Главное меню: выбор провайдера и инструментов."""
     settings = get_user_settings(chat_id)
     current = settings.get("provider", DEFAULT_PROVIDER)
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -176,6 +176,14 @@ def build_main_menu(chat_id: int):
         label = f"{'✅ ' if key == current else ''}{prov['name']}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"provider:{key}")])
     buttons.append([InlineKeyboardButton("🔧 Модели текущего провайдера", callback_data="models_menu")])
+    buttons.append([
+        InlineKeyboardButton("🧠 Викторина", callback_data="quiz_menu"),
+        InlineKeyboardButton("📊 Опрос", callback_data="poll_menu"),
+    ])
+    buttons.append([
+        InlineKeyboardButton("💻 Помощь с кодом", callback_data="code_help"),
+        InlineKeyboardButton("🎯 Задачи по коду", callback_data="code_tasks"),
+    ])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -191,6 +199,59 @@ def build_models_menu(chat_id: int):
         label = f"{'✅ ' if model_key == current_model else ''}{model_key}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"model:{model_key}")])
     buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_quiz_menu(chat_id: int):
+    """Меню викторин."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    buttons = [
+        [InlineKeyboardButton("🧠 Общие знания", callback_data="quiz:general")],
+        [InlineKeyboardButton("💻 Программирование", callback_data="quiz:programming")],
+        [InlineKeyboardButton("🌍 География", callback_data="quiz:geography")],
+        [InlineKeyboardButton("🔬 Наука", callback_data="quiz:science")],
+        [InlineKeyboardButton("🎲 Случайная", callback_data="quiz:random")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_poll_menu(chat_id: int):
+    """Меню опросов."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    buttons = [
+        [InlineKeyboardButton("💭 Мнение по теме", callback_data="poll:opinion")],
+        [InlineKeyboardButton("📊 Сравнение вариантов", callback_data="poll:compare")],
+        [InlineKeyboardButton("🎯 Приоритеты", callback_data="poll:priority")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_code_help_menu(chat_id: int):
+    """Меню помощи с кодом."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    buttons = [
+        [InlineKeyboardButton("🔍 Code Review", callback_data="code:review")],
+        [InlineKeyboardButton("📖 Объяснить код", callback_data="code:explain")],
+        [InlineKeyboardButton("🛠 Исправить баг", callback_data="code:fix")],
+        [InlineKeyboardButton("⚡ Оптимизировать", callback_data="code:optimize")],
+        [InlineKeyboardButton("📝 Написать с нуля", callback_data="code:write")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")],
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_code_tasks_menu(chat_id: int):
+    """Меню задач по программированию."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    buttons = [
+        [InlineKeyboardButton("🟢 Junior (Easy)", callback_data="task:easy")],
+        [InlineKeyboardButton("🟡 Middle (Medium)", callback_data="task:medium")],
+        [InlineKeyboardButton("🔴 Senior (Hard)", callback_data="task:hard")],
+        [InlineKeyboardButton("🎲 Случайная", callback_data="task:random")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")],
+    ]
     return InlineKeyboardMarkup(buttons)
 
 
@@ -409,6 +470,198 @@ async def judge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await thinking.edit_text(f"{emoji('error')} Ошибка: {e}")
 
 
+async def quiz_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, topic: str):
+    """Запускает викторину на выбранную тему."""
+    provider_key, model_id = get_current_model(update.message.chat_id)
+    
+    topics = {
+        "general": "общие знания",
+        "programming": "программирование",
+        "geography": "география",
+        "science": "наука",
+        "random": "случайная тема",
+    }
+    topic_name = topics.get(topic, topic)
+    
+    prompt = (
+        f"Создай 1 вопрос викторины на тему: {topic_name}. "
+        f"Формат: вопрос, 4 варианта ответа (A, B, C, D), правильный ответ. "
+        f"На русском языке."
+    )
+    
+    msg = await update.message.reply_text(f"{emoji('brain')} <b>Генерирую викторину...</b>", parse_mode=ParseMode.HTML)
+    
+    try:
+        parts = []
+        async for token, _ in call_provider_api(provider_key, model_id, [{"role": "user", "content": prompt}]):
+            parts.append(token)
+        text = "".join(parts).strip()
+        
+        # Парсим вопрос и варианты для создания опроса
+        lines = text.split("\n")
+        question = ""
+        options = []
+        correct_option = 0
+        
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if line and not question:
+                question = line.replace("Вопрос:", "").replace("Вопрос ", "").strip()
+            elif line.startswith(("A)", "B)", "C)", "D)", "А)", "Б)", "В)", "Г)")):
+                options.append(line[2:].strip())
+                if "правиль" in line.lower() or "✓" in line or "✅" in line:
+                    correct_option = len(options) - 1
+        
+        if len(options) >= 2:
+            await msg.delete()
+            await context.bot.send_poll(
+                chat_id=update.message.chat_id,
+                question=question or "Вопрос викторины",
+                options=options[:4],
+                type="quiz",
+                correct_option_id=min(correct_option, len(options) - 1),
+                explanation="Правильный ответ будет показан после голосования"
+            )
+        else:
+            await msg.edit_text(f"{emoji('brain')} <b>Викторина:</b>\n\n{md_to_html(text)}", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await msg.edit_text(f"{emoji('error')} Ошибка: {e}")
+
+
+async def poll_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, poll_type: str):
+    """Создаёт умный опрос."""
+    provider_key, model_id = get_current_model(update.message.chat_id)
+    
+    types = {
+        "opinion": "создай опрос для сбора мнений по теме, варианты: полностью согласен / скорее согласен / нейтрально / скорее нет / полностью не согласен",
+        "compare": "создай опрос для сравнения 2-3 вариантов, укажи плюсы/минусы каждого",
+        "priority": "создай опрос для определения приоритетов, варианты: высокий / средний / низкий приоритет",
+    }
+    
+    prompt = (
+        f"{types.get(poll_type, types['opinion'])}. "
+        f"Верни: вопрос опроса и 3-5 вариантов ответа. На русском."
+    )
+    
+    msg = await update.message.reply_text(f"{emoji('code')} <b>Создаю опрос...</b>", parse_mode=ParseMode.HTML)
+    
+    try:
+        parts = []
+        async for token, _ in call_provider_api(provider_key, model_id, [{"role": "user", "content": prompt}]):
+            parts.append(token)
+        text = "".join(parts).strip()
+        
+        # Парсим для создания опроса
+        lines = text.split("\n")
+        question = lines[0] if lines else "Опрос"
+        options = []
+        for line in lines[1:]:
+            line = line.strip()
+            if line.startswith(("1.", "2.", "3.", "4.", "5.", "-", "•", "A)", "B)", "C)")):
+                opt = line.lstrip("12345.-•ABC) ").strip()
+                if opt:
+                    options.append(opt)
+        
+        if len(options) >= 2:
+            await msg.delete()
+            await context.bot.send_poll(
+                chat_id=update.message.chat_id,
+                question=question,
+                options=options[:10],
+                type="regular",
+                allows_multiple_answers=False
+            )
+        else:
+            await msg.edit_text(f"{emoji('code')} <b>Опрос:</b>\n\n{md_to_html(text)}", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await msg.edit_text(f"{emoji('error')} Ошибка: {e}")
+
+
+async def code_help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str):
+    """Помощь с кодом."""
+    if not update.message.text or len(update.message.text.split()) < 2:
+        await update.message.reply_text(
+            f"{emoji('warning')} Пришли код после команды или сделай реплай на сообщение с кодом.\n"
+            f"Пример: <code>/code_review твой код здесь</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    code = update.message.text.split(" ", 1)[1]
+    # Если это реплай, берём код из реплая
+    if update.message.reply_to_message and update.message.reply_to_message.text:
+        code = update.message.reply_to_message.text
+    
+    provider_key, model_id = get_current_model(update.message.chat_id)
+    
+    actions = {
+        "review": "Сделай code review: найди баги, проблемы стиля, проблемы безопасности, предложи улучшения",
+        "explain": "Объясни что делает этот код, пошагово, простым языком",
+        "fix": "Найди и исправь все баги в коде, верни исправленную версию",
+        "optimize": "Оптимизируй код: производительность, память, читаемость",
+        "write": "Напиши код по описанию",
+    }
+    
+    prompt = (
+        f"{actions.get(action, actions['explain'])}.\n\n"
+        f"Код:\n```\n{code}\n```\n\n"
+        f"Ответ на русском, используй markdown для кода."
+    )
+    
+    msg = await update.message.reply_text(f"{emoji('code')} <b>Анализирую код...</b>", parse_mode=ParseMode.HTML)
+    
+    try:
+        parts = []
+        async for token, _ in call_provider_api(provider_key, model_id, [{"role": "user", "content": prompt}]):
+            parts.append(token)
+        result = "".join(parts).strip()
+        
+        await msg.edit_text(
+            f"{emoji('code')} <b>Результат:</b>\n\n{md_to_html(result)}",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        await msg.edit_text(f"{emoji('error')} Ошибка: {e}")
+
+
+async def task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, difficulty: str):
+    """Генерирует задачу по программированию."""
+    provider_key, model_id = get_current_model(update.message.chat_id)
+    
+    difficulties = {
+        "easy": "Junior уровень: базовые алгоритмы, массивы, строки, циклы",
+        "medium": "Middle уровень: структуры данных, DP, графы, алгоритмы сортировки",
+        "hard": "Senior уровень: сложные алгоритмы, системное проектирование, конкурентность",
+        "random": "случайная сложность",
+    }
+    
+    prompt = (
+        f"Создай задачу по программированию уровня: {difficulties.get(difficulty, difficulties['medium'])}.\n"
+        f"Формат:\n"
+        f"1. Название задачи\n"
+        f"2. Условие (входные/выходные данные, ограничения)\n"
+        f"3. Пример ввода/вывода\n"
+        f"4. Подсказка (алгоритм)\n"
+        f"5. Решение на Python с комментариями\n\n"
+        f"На русском языке."
+    )
+    
+    msg = await update.message.reply_text(f"{emoji('brain')} <b>Генерирую задачу...</b>", parse_mode=ParseMode.HTML)
+    
+    try:
+        parts = []
+        async for token, _ in call_provider_api(provider_key, model_id, [{"role": "user", "content": prompt}]):
+            parts.append(token)
+        result = "".join(parts).strip()
+        
+        await msg.edit_text(
+            f"{emoji('brain')} <b>Задача ({difficulty}):</b>\n\n{md_to_html(result)}",
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        await msg.edit_text(f"{emoji('error')} Ошибка: {e}")
+
+
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает главное меню выбора провайдера/модели."""
     chat_id = update.message.chat_id
@@ -470,6 +723,83 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await query.answer(f"Модель {model_key} недоступна для этого провайдера", show_alert=True)
+    elif data == "quiz_menu":
+        await query.edit_message_text(
+            f"{emoji('brain')} <b>Викторина</b>\n\nВыберите тему:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_quiz_menu(chat_id)
+        )
+    elif data == "poll_menu":
+        await query.edit_message_text(
+            f"{emoji('code')} <b>Умные опросы</b>\n\nВыберите тип:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_poll_menu(chat_id)
+        )
+    elif data == "code_help":
+        await query.edit_message_text(
+            f"{emoji('code')} <b>Помощь с кодом</b>\n\nВыберите действие:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_code_help_menu(chat_id)
+        )
+    elif data == "code_tasks":
+        await query.edit_message_text(
+            f"{emoji('brain')} <b>Задачи по программированию</b>\n\nВыберите уровень:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_code_tasks_menu(chat_id)
+        )
+    elif data.startswith("quiz:"):
+        topic = data.split(":")[1]
+        await query.answer()
+        # Создаём фейковое сообщение для quiz_handler
+        class FakeMessage:
+            def __init__(self, chat_id, from_user):
+                self.chat_id = chat_id
+                self.from_user = from_user
+                self.chat = type('obj', (object,), {'id': chat_id, 'type': 'private'})()
+        fake_update = type('obj', (object,), {
+            'message': FakeMessage(chat_id, query.from_user),
+            'callback_query': query
+        })()
+        await quiz_handler(fake_update, context, topic)
+    elif data.startswith("poll:"):
+        poll_type = data.split(":")[1]
+        await query.answer()
+        class FakeMessage:
+            def __init__(self, chat_id, from_user):
+                self.chat_id = chat_id
+                self.from_user = from_user
+                self.chat = type('obj', (object,), {'id': chat_id, 'type': 'private'})()
+        fake_update = type('obj', (object,), {
+            'message': FakeMessage(chat_id, query.from_user),
+            'callback_query': query
+        })()
+        await poll_handler(fake_update, context, poll_type)
+    elif data.startswith("code:"):
+        action = data.split(":")[1]
+        await query.answer()
+        class FakeMessage:
+            def __init__(self, chat_id, from_user):
+                self.chat_id = chat_id
+                self.from_user = from_user
+                self.chat = type('obj', (object,), {'id': chat_id, 'type': 'private'})()
+        fake_update = type('obj', (object,), {
+            'message': FakeMessage(chat_id, query.from_user),
+            'callback_query': query
+        })()
+        await code_help_handler(fake_update, context, action)
+    elif data.startswith("task:"):
+        difficulty = data.split(":")[1]
+        await query.answer()
+        class FakeMessage:
+            def __init__(self, chat_id, from_user):
+                self.chat_id = chat_id
+                self.from_user = from_user
+                self.chat = type('obj', (object,), {'id': chat_id, 'type': 'private'})()
+        fake_update = type('obj', (object,), {
+            'message': FakeMessage(chat_id, query.from_user),
+            'callback_query': query
+        })()
+        await task_handler(fake_update, context, difficulty)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -652,6 +982,11 @@ def main():
     app.add_handler(CommandHandler("context", context_command))
     app.add_handler(CommandHandler("summary", summary_command))
     app.add_handler(CommandHandler("judge", judge_command))
+    # Новые команды для кнопок
+    app.add_handler(CommandHandler("quiz", lambda u, c: quiz_handler(u, c, c.args[0] if c.args else "random")))
+    app.add_handler(CommandHandler("poll", lambda u, c: poll_handler(u, c, c.args[0] if c.args else "opinion")))
+    app.add_handler(CommandHandler("code", lambda u, c: code_help_handler(u, c, c.args[0] if c.args else "explain")))
+    app.add_handler(CommandHandler("task", lambda u, c: task_handler(u, c, c.args[0] if c.args else "medium")))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
