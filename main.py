@@ -313,7 +313,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"{emoji('rocket')} <b>Бот готов к работе</b>\n\n"
         f"{emoji('brain')} Отвечаю на русском с рассуждениями\n"
-        f"{emoji('gear')} Работаю в личке, по @username и по reply\n"
+        f"{emoji('gear')} Работаю в личке, по @numbertree_bot и по reply\n"
         f"{emoji('spark')} Помню контекст диалога\n"
         f"{emoji('code')} /menu — выбор модели и провайдера\n"
         f"{emoji('code')} /clear — сбросить память",
@@ -331,7 +331,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text(
                 f"{emoji('rocket')} <b>Привет, {member.mention_html()}!</b>\n\n"
                 f"{emoji('brain')} Я ИИ-ассистент с выбором моделей (NVIDIA / Groq).\n"
-                f"{emoji('gear')} Отвечаю по @username или reply.\n\n"
+                f"{emoji('gear')} Отвечаю по @numbertree_bot или reply.\n\n"
                 f"Выберите модель и провайдера:",
                 parse_mode=ParseMode.HTML,
                 reply_markup=build_main_menu(update.message.chat_id)
