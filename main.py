@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 
 BOT_USERNAME = None
 
+# Хранилище контекста диалогов: chat_id -> список сообщений
+CONVERSATION_HISTORY = {}
+MAX_HISTORY = 10  # сколько пар запрос-ответ запоминаем
+
 # ============ CUSTOM EMOJI CONFIG ============
 # Получите custom_emoji_id из пака https://t.me/addemoji/GameEmoji
 # דרך: отправьте эмодзи боту @userinfobot → скопируйте custom_emoji_id
@@ -92,13 +96,14 @@ def should_respond(update: Update) -> bool:
 
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
 NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-MODEL = "nvidia/nemotron-mini-4b-instruct"
+MODEL = "deepseek-ai/deepseek-v4-flash-0731"
 
 if not NVIDIA_API_KEY:
     raise ValueError("Установите переменную окружения NVIDIA_API_KEY")
 
 
-async def call_nvidia_api(messages: list[dict], stream: bool = True) -> AsyncGenerator[str, None]:
+async def call_nvidia_api(messages: list[dict], stream: bool = True) -> AsyncGenerator[tuple[str, dict], None]:
+    """Yields (content_token, usage_dict). usage_dict is empty until final chunk."""
     headers = {
         "Authorization": f"Bearer {NVIDIA_API_KEY}",
         "Content-Type": "application/json",
@@ -107,7 +112,7 @@ async def call_nvidia_api(messages: list[dict], stream: bool = True) -> AsyncGen
         "model": MODEL,
         "messages": messages,
         "stream": stream,
-        "temperature": 0.7,
+        "temperature": 0.6,
         "max_tokens": 4096,
     }
 
@@ -118,6 +123,7 @@ async def call_nvidia_api(messages: list[dict], stream: bool = True) -> AsyncGen
                 logger.error(f"NVIDIA API error {response.status_code}: {error_text}")
                 raise httpx.HTTPStatusError(f"NVIDIA API error: {response.status_code}", request=response.request, response=response)
             
+            usage = {}
             async for line in response.aiter_lines():
                 if line.startswith("data: "):
                     data = line[6:]
@@ -128,18 +134,32 @@ async def call_nvidia_api(messages: list[dict], stream: bool = True) -> AsyncGen
                         chunk = json.loads(data)
                         delta = chunk.get("choices", [{}])[0].get("delta", {})
                         content = delta.get("content", "")
+                        # usage приходит в последнем чанке
+                        if "usage" in chunk:
+                            usage = chunk["usage"]
                         if content:
-                            yield content
+                            yield content, usage
                     except json.JSONDecodeError:
                         continue
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"{emoji('rocket')} <b>Nemotron Mini 4B — готов к работе</b>\n\n"
+        f"{emoji('rocket')} <b>DeepSeek V4 Flash — готов к работе</b>\n\n"
         f"{emoji('brain')} Быстрые ответы с рассуждениями\n"
         f"{emoji('gear')} Работаю в личке, по @username и по reply\n"
-        f"{emoji('spark')} Просто задайте вопрос",
+        f"{emoji('spark')} Помню контекст диалога (до {MAX_HISTORY} сообщений)\n"
+        f"{emoji('code')} /clear — сбросить память",
+        parse_mode=ParseMode.HTML
+    )
+
+
+async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    if chat_id in CONVERSATION_HISTORY:
+        del CONVERSATION_HISTORY[chat_id]
+    await update.message.reply_text(
+        f"{emoji('check')} <b>История диалога очищена</b>",
         parse_mode=ParseMode.HTML
     )
 
@@ -158,23 +178,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if BOT_USERNAME:
         user_text = user_text.replace(f"@{BOT_USERNAME}", "").strip()
 
+    chat_id = update.message.chat_id
+
+    # Получаем историю диалога
+    history = CONVERSATION_HISTORY.get(chat_id, [])
+
     # Начальное сообщение с анимированным эмодзи
     thinking_msg = await update.message.reply_text(
         f"{emoji('thinking')} <b>Думаю...</b> ⏱ <i>0с</i>",
         parse_mode=ParseMode.HTML
     )
 
-    user_prompt = f"Answer step by step. Question: {user_text}"
-    messages = [{"role": "user", "content": user_prompt}]
+    # Строим сообщения с историей
+    messages = []
+    for h in history:
+        messages.append({"role": "user", "content": h["user"]})
+        messages.append({"role": "assistant", "content": h["assistant"]})
+    messages.append({"role": "user", "content": f"Answer step by step. Question: {user_text}"})
 
     all_parts = []
     last_edit_len = 0
     start_time = asyncio.get_event_loop().time()
+    usage = {}
 
     try:
-        async for token in call_nvidia_api(messages):
+        async for token, u in call_nvidia_api(messages):
             all_parts.append(token)
             full_text = "".join(all_parts)
+            if u:
+                usage = u
 
             # Обновляем каждые ~300 символов + таймер
             elapsed = int(asyncio.get_event_loop().time() - start_time)
@@ -202,10 +234,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     full_text = "".join(all_parts).strip()
     elapsed = int(asyncio.get_event_loop().time() - start_time)
 
+    # Сохраняем в историю
+    history.append({"user": user_text, "assistant": full_text})
+    if len(history) > MAX_HISTORY:
+        history.pop(0)
+    CONVERSATION_HISTORY[chat_id] = history
+
+    # Информация о токенах
+    token_info = ""
+    if usage:
+        prompt_tokens = usage.get("prompt_tokens", 0)
+        completion_tokens = usage.get("completion_tokens", 0)
+        total_tokens = usage.get("total_tokens", 0)
+        token_info = f"\n\n{emoji('code')} <b>Токены:</b> {prompt_tokens} + {completion_tokens} = {total_tokens}"
+
     # Красивый финальный ответ с мозгом 🧠
     final_text = (
         f"{emoji('brain')} <b>Ответ</b> <i>({elapsed}с)</i>\n\n"
         f"{md_to_html(full_text)}"
+        f"{token_info}"
     )
 
     try:
@@ -230,6 +277,7 @@ def main():
 
     app.post_init = post_init
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("clear", clear_history))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     import asyncio
