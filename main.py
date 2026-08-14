@@ -65,9 +65,15 @@ def emoji(key: str) -> str:
 
 
 def md_to_html(text: str) -> str:
-    """Конвертирует markdown в HTML для Telegram."""
+    """Конвертирует markdown в HTML для Telegram. Также чистит лишний HTML."""
     if not text:
         return ""
+    # Сначала экранируем HTML-сущности, потом конвертим markdown
+    import html as html_module
+    # Если текст уже содержит HTML-теги — вытащим текст
+    if re.search(r'<[^>]+>', text):
+        # Убираем HTML теги, оставляем содержимое
+        text = re.sub(r'<[^>]+>', '', text)
     md = markdown.Markdown(
         extensions=["fenced_code", "tables", "nl2br", "sane_lists"],
         output_format="html",
@@ -236,7 +242,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for h in history:
         messages.append({"role": "user", "content": h["user"]})
         messages.append({"role": "assistant", "content": h["assistant"]})
-    messages.append({"role": "user", "content": f"Answer step by step. Question: {user_text}"})
+    messages.append({"role": "user", "content": f"Answer step by step. Use markdown formatting (code blocks, bold, lists). No HTML. Question: {user_text}"})
 
     all_parts = []
     last_edit_len = 0
