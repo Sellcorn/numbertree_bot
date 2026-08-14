@@ -866,6 +866,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Фоновая задача для обновления таймера каждые 2 секунды
     stop_timer = asyncio.Event()
     last_timer_text = ""
+    edit_lock = asyncio.Lock()  # Защита от race condition при edit_text
 
     async def timer_updater():
         nonlocal last_timer_text
@@ -880,11 +881,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"<blockquote expandable>{preview}</blockquote>"
             )
             if timer_text != last_timer_text:
-                try:
-                    await thinking_msg.edit_text(timer_text, parse_mode=ParseMode.HTML)
-                    last_timer_text = timer_text
-                except Exception:
-                    pass
+                async with edit_lock:
+                    try:
+                        await thinking_msg.edit_text(timer_text, parse_mode=ParseMode.HTML)
+                        last_timer_text = timer_text
+                    except Exception:
+                        pass
 
     timer_task = asyncio.create_task(timer_updater())
 
@@ -900,14 +902,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if len(full_text) - last_edit_len >= 300:
                 last_edit_len = len(full_text)
                 preview = full_text[-2500:]
-                try:
-                    await thinking_msg.edit_text(
-                        f"{emoji('thinking')} <b>Обрабатываю...</b> ⏱ <i>{elapsed}с</i> ({provider_name})\n\n"
-                        f"<blockquote expandable>{preview}</blockquote>",
-                        parse_mode=ParseMode.HTML
-                    )
-                except Exception:
-                    pass
+                async with edit_lock:
+                    try:
+                        await thinking_msg.edit_text(
+                            f"{emoji('thinking')} <b>Обрабатываю...</b> ⏱ <i>{elapsed}с</i> ({provider_name})\n\n"
+                            f"<blockquote expandable>{preview}</blockquote>",
+                            parse_mode=ParseMode.HTML
+                        )
+                    except Exception:
+                        pass
     except Exception as e:
         logger.error(f"API call failed: {e}")
         await thinking_msg.edit_text(
