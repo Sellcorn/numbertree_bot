@@ -113,7 +113,11 @@ async def call_nvidia_api(messages: list[dict], stream: bool = True) -> AsyncGen
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         async with client.stream("POST", NVIDIA_API_URL, headers=headers, json=payload) as response:
-            response.raise_for_status()
+            if response.status_code != 200:
+                error_text = await response.aread()
+                logger.error(f"NVIDIA API error {response.status_code}: {error_text}")
+                raise httpx.HTTPStatusError(f"NVIDIA API error: {response.status_code}", request=response.request, response=response)
+            
             async for line in response.aiter_lines():
                 if line.startswith("data: "):
                     data = line[6:]
@@ -167,23 +171,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_edit_len = 0
     start_time = asyncio.get_event_loop().time()
 
-    async for token in call_nvidia_api(messages):
-        all_parts.append(token)
-        full_text = "".join(all_parts)
+    try:
+        async for token in call_nvidia_api(messages):
+            all_parts.append(token)
+            full_text = "".join(all_parts)
 
-        # Обновляем каждые ~300 символов + таймер
-        elapsed = int(asyncio.get_event_loop().time() - start_time)
-        if len(full_text) - last_edit_len >= 300:
-            last_edit_len = len(full_text)
-            preview = full_text[-2500:]
-            try:
-                await thinking_msg.edit_text(
-                    f"{emoji('thinking')} <b>Обрабатываю...</b> ⏱ <i>{elapsed}с</i>\n\n"
-                    f"<blockquote expandable>{preview}</blockquote>",
-                    parse_mode=ParseMode.HTML
-                )
-            except Exception:
-                pass
+            # Обновляем каждые ~300 символов + таймер
+            elapsed = int(asyncio.get_event_loop().time() - start_time)
+            if len(full_text) - last_edit_len >= 300:
+                last_edit_len = len(full_text)
+                preview = full_text[-2500:]
+                try:
+                    await thinking_msg.edit_text(
+                        f"{emoji('thinking')} <b>Обрабатываю...</b> ⏱ <i>{elapsed}с</i>\n\n"
+                        f"<blockquote expandable>{preview}</blockquote>",
+                        parse_mode=ParseMode.HTML
+                    )
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.error(f"NVIDIA API call failed: {e}")
+        await thinking_msg.edit_text(
+            f"{emoji('error')} <b>Ошибка API</b>\n\n"
+            f"<code>{str(e)[:500]}</code>\n\n"
+            f"Попробуйте позже или задайте другой вопрос.",
+            parse_mode=ParseMode.HTML
+        )
+        return
 
     full_text = "".join(all_parts).strip()
     elapsed = int(asyncio.get_event_loop().time() - start_time)
