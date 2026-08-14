@@ -96,15 +96,12 @@ def emoji(key: str) -> str:
 
 
 def md_to_html(text: str) -> str:
-    """Конвертирует markdown в HTML для Telegram. Также чистит лишний HTML."""
+    """Конвертирует markdown в HTML для Telegram. Агрессивно удаляет HTML."""
     if not text:
         return ""
-    # Сначала экранируем HTML-сущности, потом конвертим markdown
-    import html as html_module
-    # Если текст уже содержит HTML-теги — вытащим текст
-    if re.search(r'<[^>]+>', text):
-        # Убираем HTML теги, оставляем содержимое
-        text = re.sub(r'<[^>]+>', '', text)
+    # СНАЧАЛА удаляем ВСЕ HTML-теги (модели часто выдают HTML вместо markdown)
+    text = re.sub(r'<[^>]+>', '', text)
+    # Затем конвертируем markdown в HTML
     md = markdown.Markdown(
         extensions=["fenced_code", "tables", "nl2br", "sane_lists"],
         output_format="html",
@@ -368,7 +365,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for h in history:
         messages.append({"role": "user", "content": h["user"]})
         messages.append({"role": "assistant", "content": h["assistant"]})
-    messages.append({"role": "user", "content": f"Отвечай на русском. Рассуждай шаг за шагом. Используй markdown-форматирование (блоки кода, жирный, списки). Без HTML. Вопрос: {user_text}"})
+    messages.append({"role": "user", "content": f"ТЫ ОБЯЗАН ОТВЕЧАТЬ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ. ЗАПРЕЩЕНО ИСПОЛЬЗОВАТЬ HTML-ТЕГИ (<hr>, <strong>, <b>, <ol>, <ul>, <li>, <h1>, <h2>, <h3>, <p>, <div>, <span> И ДРУГИЕ). ИСПОЛЬЗУЙ ТОЛЬКО MARKDOWN: **жирный**, *курсив*, `код`, ```блоки кода```, - списки, 1. нумерованные списки, > цитаты. РАССУЖДАЙ ШАГ ЗА ШАГОМ. ВОПРОС: {user_text}"})
 
     all_parts = []
     last_edit_len = 0
@@ -448,6 +445,14 @@ def main():
         me = await app.bot.get_me()
         BOT_USERNAME = me.username
         logger.info(f"Бот @{BOT_USERNAME} запущен")
+
+        # Устанавливаем меню бота (кнопки слева от поля ввода)
+        from telegram import BotCommand
+        await app.bot.set_my_commands([
+            BotCommand("menu", "🤖 Выбрать модель и провайдера"),
+            BotCommand("clear", "🗑 Очистить историю диалога"),
+            BotCommand("start", "🚀 Перезапуск бота"),
+        ])
 
     app.post_init = post_init
     app.add_handler(CommandHandler("start", start))
