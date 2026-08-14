@@ -242,12 +242,14 @@ async def call_provider_api(provider_key: str, model_id: str, messages: list[dic
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"{emoji('rocket')} <b>DeepSeek V4 Flash — готов к работе</b>\n\n"
-        f"{emoji('brain')} Быстрые ответы с рассуждениями\n"
+        f"{emoji('rocket')} <b>Бот готов к работе</b>\n\n"
+        f"{emoji('brain')} Отвечаю на русском с рассуждениями\n"
         f"{emoji('gear')} Работаю в личке, по @username и по reply\n"
-        f"{emoji('spark')} Помню контекст диалога (до {MAX_HISTORY} сообщений)\n"
+        f"{emoji('spark')} Помню контекст диалога\n"
+        f"{emoji('code')} /menu — выбор модели и провайдера\n"
         f"{emoji('code')} /clear — сбросить память",
-        parse_mode=ParseMode.HTML
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_main_menu(update.message.chat_id)
     )
 
 
@@ -366,7 +368,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for h in history:
         messages.append({"role": "user", "content": h["user"]})
         messages.append({"role": "assistant", "content": h["assistant"]})
-    messages.append({"role": "user", "content": f"Answer step by step. Use markdown formatting (code blocks, bold, lists). No HTML. Question: {user_text}"})
+    messages.append({"role": "user", "content": f"Отвечай на русском. Рассуждай шаг за шагом. Используй markdown-форматирование (блоки кода, жирный, списки). Без HTML. Вопрос: {user_text}"})
 
     all_parts = []
     last_edit_len = 0
