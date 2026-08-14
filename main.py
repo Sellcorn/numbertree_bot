@@ -470,9 +470,56 @@ async def judge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await thinking.edit_text(f"{emoji('error')} Ошибка: {e}")
 
 
-async def quiz_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, topic: str):
-    """Запускает викторину на выбранную тему."""
-    provider_key, model_id = get_current_model(update.message.chat_id)
+async def quiz_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запускает викторину на выбранную тему: /quiz [topic]"""
+    topic = context.args[0] if context.args else "random"
+    await _run_quiz(update.message.chat_id, context, topic)
+
+
+async def poll_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Создаёт умный опрос: /poll [type]"""
+    poll_type = context.args[0] if context.args else "opinion"
+    await _run_poll(update.message.chat_id, context, poll_type)
+
+
+async def code_help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Помощь с кодом: /code [action] [code] или реплай на сообщение с кодом"""
+    if not update.message.text or len(update.message.text.split()) < 2:
+        await update.message.reply_text(
+            f"{emoji('warning')} Пришли код после команды или сделай реплай на сообщение с кодом.\n"
+            f"Пример: <code>/code review твой код здесь</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    action = context.args[0] if context.args else "explain"
+    
+    # Получаем код: из аргументов команды или из реплая
+    if len(context.args) > 1:
+        code = " ".join(context.args[1:])
+    elif update.message.reply_to_message and update.message.reply_to_message.text:
+        code = update.message.reply_to_message.text
+    else:
+        await update.message.reply_text(
+            f"{emoji('warning')} Пришли код после команды или сделай реплай на сообщение с кодом.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+    
+    await _run_code_help(update.message.chat_id, context, action, code)
+
+
+async def task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Генерирует задачу по программированию: /task [difficulty]"""
+    difficulty = context.args[0] if context.args else "medium"
+    await _run_task(update.message.chat_id, context, difficulty)
+
+
+# ===== Внутренние функции для команд и callback =====
+
+async def _run_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE, topic: str):
+    """Внутренняя функция для запуска викторины."""
+    provider_key, model_id = get_current_model(chat_id)
     
     topics = {
         "general": "общие знания",
@@ -489,7 +536,10 @@ async def quiz_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, topic
         f"На русском языке."
     )
     
-    msg = await update.message.reply_text(f"{emoji('brain')} <b>Генерирую викторину...</b>", parse_mode=ParseMode.HTML)
+    # Отправляем временное сообщение через bot напрямую
+    from telegram import Bot
+    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    msg = await bot.send_message(chat_id, f"{emoji('brain')} <b>Генерирую викторину...</b>", parse_mode=ParseMode.HTML)
     
     try:
         parts = []
@@ -513,9 +563,9 @@ async def quiz_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, topic
                     correct_option = len(options) - 1
         
         if len(options) >= 2:
-            await msg.delete()
-            await context.bot.send_poll(
-                chat_id=update.message.chat_id,
+            await bot.delete_message(chat_id, msg.message_id)
+            await bot.send_poll(
+                chat_id=chat_id,
                 question=question or "Вопрос викторины",
                 options=options[:4],
                 type="quiz",
@@ -523,14 +573,23 @@ async def quiz_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, topic
                 explanation="Правильный ответ будет показан после голосования"
             )
         else:
-            await msg.edit_text(f"{emoji('brain')} <b>Викторина:</b>\n\n{md_to_html(text)}", parse_mode=ParseMode.HTML)
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg.message_id,
+                text=f"{emoji('brain')} <b>Викторина:</b>\n\n{md_to_html(text)}",
+                parse_mode=ParseMode.HTML
+            )
     except Exception as e:
-        await msg.edit_text(f"{emoji('error')} Ошибка: {e}")
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg.message_id,
+            text=f"{emoji('error')} Ошибка: {e}"
+        )
 
 
-async def poll_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, poll_type: str):
-    """Создаёт умный опрос."""
-    provider_key, model_id = get_current_model(update.message.chat_id)
+async def _run_poll(chat_id: int, context: ContextTypes.DEFAULT_TYPE, poll_type: str):
+    """Внутренняя функция для создания опроса."""
+    provider_key, model_id = get_current_model(chat_id)
     
     types = {
         "opinion": "создай опрос для сбора мнений по теме, варианты: полностью согласен / скорее согласен / нейтрально / скорее нет / полностью не согласен",
@@ -543,7 +602,9 @@ async def poll_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, poll_
         f"Верни: вопрос опроса и 3-5 вариантов ответа. На русском."
     )
     
-    msg = await update.message.reply_text(f"{emoji('code')} <b>Создаю опрос...</b>", parse_mode=ParseMode.HTML)
+    from telegram import Bot
+    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    msg = await bot.send_message(chat_id, f"{emoji('code')} <b>Создаю опрос...</b>", parse_mode=ParseMode.HTML)
     
     try:
         parts = []
@@ -563,36 +624,32 @@ async def poll_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, poll_
                     options.append(opt)
         
         if len(options) >= 2:
-            await msg.delete()
-            await context.bot.send_poll(
-                chat_id=update.message.chat_id,
+            await bot.delete_message(chat_id, msg.message_id)
+            await bot.send_poll(
+                chat_id=chat_id,
                 question=question,
                 options=options[:10],
                 type="regular",
                 allows_multiple_answers=False
             )
         else:
-            await msg.edit_text(f"{emoji('code')} <b>Опрос:</b>\n\n{md_to_html(text)}", parse_mode=ParseMode.HTML)
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg.message_id,
+                text=f"{emoji('code')} <b>Опрос:</b>\n\n{md_to_html(text)}",
+                parse_mode=ParseMode.HTML
+            )
     except Exception as e:
-        await msg.edit_text(f"{emoji('error')} Ошибка: {e}")
-
-
-async def code_help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str):
-    """Помощь с кодом."""
-    if not update.message.text or len(update.message.text.split()) < 2:
-        await update.message.reply_text(
-            f"{emoji('warning')} Пришли код после команды или сделай реплай на сообщение с кодом.\n"
-            f"Пример: <code>/code_review твой код здесь</code>",
-            parse_mode=ParseMode.HTML
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg.message_id,
+            text=f"{emoji('error')} Ошибка: {e}"
         )
-        return
-    
-    code = update.message.text.split(" ", 1)[1]
-    # Если это реплай, берём код из реплая
-    if update.message.reply_to_message and update.message.reply_to_message.text:
-        code = update.message.reply_to_message.text
-    
-    provider_key, model_id = get_current_model(update.message.chat_id)
+
+
+async def _run_code_help(chat_id: int, context: ContextTypes.DEFAULT_TYPE, action: str, code: str = None):
+    """Внутренняя функция для помощи с кодом."""
+    provider_key, model_id = get_current_model(chat_id)
     
     actions = {
         "review": "Сделай code review: найди баги, проблемы стиля, проблемы безопасности, предложи улучшения",
@@ -608,7 +665,9 @@ async def code_help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         f"Ответ на русском, используй markdown для кода."
     )
     
-    msg = await update.message.reply_text(f"{emoji('code')} <b>Анализирую код...</b>", parse_mode=ParseMode.HTML)
+    from telegram import Bot
+    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    msg = await bot.send_message(chat_id, f"{emoji('code')} <b>Анализирую код...</b>", parse_mode=ParseMode.HTML)
     
     try:
         parts = []
@@ -616,17 +675,23 @@ async def code_help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             parts.append(token)
         result = "".join(parts).strip()
         
-        await msg.edit_text(
-            f"{emoji('code')} <b>Результат:</b>\n\n{md_to_html(result)}",
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg.message_id,
+            text=f"{emoji('code')} <b>Результат:</b>\n\n{md_to_html(result)}",
             parse_mode=ParseMode.HTML
         )
     except Exception as e:
-        await msg.edit_text(f"{emoji('error')} Ошибка: {e}")
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg.message_id,
+            text=f"{emoji('error')} Ошибка: {e}"
+        )
 
 
-async def task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, difficulty: str):
-    """Генерирует задачу по программированию."""
-    provider_key, model_id = get_current_model(update.message.chat_id)
+async def _run_task(chat_id: int, context: ContextTypes.DEFAULT_TYPE, difficulty: str):
+    """Внутренняя функция для генерации задачи."""
+    provider_key, model_id = get_current_model(chat_id)
     
     difficulties = {
         "easy": "Junior уровень: базовые алгоритмы, массивы, строки, циклы",
@@ -646,7 +711,9 @@ async def task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, diffi
         f"На русском языке."
     )
     
-    msg = await update.message.reply_text(f"{emoji('brain')} <b>Генерирую задачу...</b>", parse_mode=ParseMode.HTML)
+    from telegram import Bot
+    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    msg = await bot.send_message(chat_id, f"{emoji('brain')} <b>Генерирую задачу...</b>", parse_mode=ParseMode.HTML)
     
     try:
         parts = []
@@ -654,12 +721,18 @@ async def task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, diffi
             parts.append(token)
         result = "".join(parts).strip()
         
-        await msg.edit_text(
-            f"{emoji('brain')} <b>Задача ({difficulty}):</b>\n\n{md_to_html(result)}",
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg.message_id,
+            text=f"{emoji('brain')} <b>Задача ({difficulty}):</b>\n\n{md_to_html(result)}",
             parse_mode=ParseMode.HTML
         )
     except Exception as e:
-        await msg.edit_text(f"{emoji('error')} Ошибка: {e}")
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg.message_id,
+            text=f"{emoji('error')} Ошибка: {e}"
+        )
 
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -750,56 +823,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("quiz:"):
         topic = data.split(":")[1]
         await query.answer()
-        # Создаём фейковое сообщение для quiz_handler
-        class FakeMessage:
-            def __init__(self, chat_id, from_user):
-                self.chat_id = chat_id
-                self.from_user = from_user
-                self.chat = type('obj', (object,), {'id': chat_id, 'type': 'private'})()
-        fake_update = type('obj', (object,), {
-            'message': FakeMessage(chat_id, query.from_user),
-            'callback_query': query
-        })()
-        await quiz_handler(fake_update, context, topic)
+        await _run_quiz(chat_id, context, topic)
     elif data.startswith("poll:"):
         poll_type = data.split(":")[1]
         await query.answer()
-        class FakeMessage:
-            def __init__(self, chat_id, from_user):
-                self.chat_id = chat_id
-                self.from_user = from_user
-                self.chat = type('obj', (object,), {'id': chat_id, 'type': 'private'})()
-        fake_update = type('obj', (object,), {
-            'message': FakeMessage(chat_id, query.from_user),
-            'callback_query': query
-        })()
-        await poll_handler(fake_update, context, poll_type)
+        await _run_poll(chat_id, context, poll_type)
     elif data.startswith("code:"):
         action = data.split(":")[1]
         await query.answer()
-        class FakeMessage:
-            def __init__(self, chat_id, from_user):
-                self.chat_id = chat_id
-                self.from_user = from_user
-                self.chat = type('obj', (object,), {'id': chat_id, 'type': 'private'})()
-        fake_update = type('obj', (object,), {
-            'message': FakeMessage(chat_id, query.from_user),
-            'callback_query': query
-        })()
-        await code_help_handler(fake_update, context, action)
+        # Для помощи с кодом нужно, чтобы пользователь прислал код после
+        await query.edit_message_text(
+            f"{emoji('warning')} Пришли код после нажатия кнопки или сделай реплай на сообщение с кодом.\n"
+            f"Пример: <code>/code review твой код</code>",
+            parse_mode=ParseMode.HTML
+        )
     elif data.startswith("task:"):
         difficulty = data.split(":")[1]
         await query.answer()
-        class FakeMessage:
-            def __init__(self, chat_id, from_user):
-                self.chat_id = chat_id
-                self.from_user = from_user
-                self.chat = type('obj', (object,), {'id': chat_id, 'type': 'private'})()
-        fake_update = type('obj', (object,), {
-            'message': FakeMessage(chat_id, query.from_user),
-            'callback_query': query
-        })()
-        await task_handler(fake_update, context, difficulty)
+        await _run_task(chat_id, context, difficulty)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
