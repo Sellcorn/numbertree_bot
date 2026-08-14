@@ -153,7 +153,9 @@ def get_current_model(chat_id: int) -> tuple[str, str]:
     settings = get_user_settings(chat_id)
     provider = settings.get("provider", DEFAULT_PROVIDER)
     model_key = settings.get("model", PROVIDERS[provider]["default"])
-    model_id = PROVIDERS[provider]["models"].get(model_key, PROVIDERS[provider]["default"])
+    # fallback на model_id, а не на ключ
+    default_model_id = PROVIDERS[provider]["models"][PROVIDERS[provider]["default"]]
+    model_id = PROVIDERS[provider]["models"].get(model_key, default_model_id)
     return provider, model_id
 
 
@@ -227,7 +229,10 @@ async def call_provider_api(provider_key: str, model_id: str, messages: list[dic
                     try:
                         import json
                         chunk = json.loads(data)
-                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        choices = chunk.get("choices", [])
+                        if not choices:
+                            continue
+                        delta = choices[0].get("delta", {})
                         content = delta.get("content", "")
                         if "usage" in chunk:
                             usage = chunk["usage"]
@@ -316,6 +321,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         model_key = data.split(":")[1]
         settings = get_user_settings(chat_id)
         provider_key = settings.get("provider", DEFAULT_PROVIDER)
+        # Проверяем что модель существует у текущего провайдера
         if model_key in PROVIDERS[provider_key]["models"]:
             set_user_model(chat_id, model_key)
             await query.edit_message_text(
@@ -323,6 +329,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML,
                 reply_markup=build_models_menu(chat_id)
             )
+        else:
+            await query.answer(f"Модель {model_key} недоступна для этого провайдера", show_alert=True)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
