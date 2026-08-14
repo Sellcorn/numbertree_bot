@@ -26,6 +26,37 @@ CONVERSATION_HISTORY = {}
 MAX_HISTORY_PRIVATE = 10   # личка: полная память
 MAX_HISTORY_GROUP = 3      # группы: короткая память на пользователя
 
+# Настройки провайдеров и моделей
+PROVIDERS = {
+    "nvidia": {
+        "name": "NVIDIA",
+        "api_key": os.getenv("NVIDIA_API_KEY"),
+        "api_url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "models": {
+            "deepseek-v4-flash": "deepseek-ai/deepseek-v4-flash-0731",
+            "nemotron-70b": "nvidia/llama-3.1-nemotron-70b-instruct",
+            "llama-8b": "meta/llama-3.1-8b-instruct",
+        },
+        "default": "deepseek-v4-flash",
+    },
+    "groq": {
+        "name": "Groq",
+        "api_key": os.getenv("GROQ_API_KEY"),
+        "api_url": "https://api.groq.com/openai/v1/chat/completions",
+        "models": {
+            "llama-3.3-70b": "llama-3.3-70b-versatile",
+            "llama-3.1-8b": "llama-3.1-8b-instant",
+            "mixtral-8x7b": "mixtral-8x7b-32768",
+            "gemma2-9b": "gemma2-9b-it",
+        },
+        "default": "llama-3.3-70b",
+    },
+}
+
+# Пользовательские настройки: chat_id -> {provider, model}
+USER_SETTINGS = {}
+DEFAULT_PROVIDER = "nvidia"
+
 # ============ CUSTOM EMOJI CONFIG ============
 # Получите custom_emoji_id из пака https://t.me/addemoji/GameEmoji
 # דרך: отправьте эмодзи боту @userinfobot → скопируйте custom_emoji_id
@@ -101,83 +132,112 @@ def should_respond(update: Update) -> bool:
     return False
 
 
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
-NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-
-if not NVIDIA_API_KEY:
-    raise ValueError("Установите переменную окружения NVIDIA_API_KEY")
+def get_user_settings(chat_id: int) -> dict:
+    """Получает настройки пользователя (провайдер, модель)."""
+    return USER_SETTINGS.get(chat_id, {"provider": DEFAULT_PROVIDER})
 
 
-async def call_nvidia_api(messages: list[dict], stream: bool = True) -> AsyncGenerator[tuple[str, dict], None]:
-    """Yields (content_token, usage_dict). usage_dict is empty until final chunk.
-    Retries on 429/529/503 with exponential backoff. Falls back to alternative model."""
+def set_user_provider(chat_id: int, provider: str):
+    if chat_id not in USER_SETTINGS:
+        USER_SETTINGS[chat_id] = {"provider": DEFAULT_PROVIDER}
+    USER_SETTINGS[chat_id]["provider"] = provider
+    # Сбрасываем модель на дефолт для нового провайдера
+    USER_SETTINGS[chat_id]["model"] = PROVIDERS[provider]["default"]
+
+
+def set_user_model(chat_id: int, model_key: str):
+    if chat_id not in USER_SETTINGS:
+        USER_SETTINGS[chat_id] = {"provider": DEFAULT_PROVIDER}
+    USER_SETTINGS[chat_id]["model"] = model_key
+
+
+def get_current_model(chat_id: int) -> tuple[str, str]:
+    """Возвращает (provider, model_id) для чата."""
+    settings = get_user_settings(chat_id)
+    provider = settings.get("provider", DEFAULT_PROVIDER)
+    model_key = settings.get("model", PROVIDERS[provider]["default"])
+    model_id = PROVIDERS[provider]["models"].get(model_key, PROVIDERS[provider]["default"])
+    return provider, model_id
+
+
+# Inline клавиатуры для меню
+def build_main_menu(chat_id: int):
+    """Главное меню: выбор провайдера."""
+    settings = get_user_settings(chat_id)
+    current = settings.get("provider", DEFAULT_PROVIDER)
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    buttons = []
+    for key, prov in PROVIDERS.items():
+        label = f"{'✅ ' if key == current else ''}{prov['name']}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"provider:{key}")])
+    buttons.append([InlineKeyboardButton("🔧 Модели текущего провайдера", callback_data="models_menu")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_models_menu(chat_id: int):
+    """Меню выбора модели для текущего провайдера."""
+    settings = get_user_settings(chat_id)
+    provider_key = settings.get("provider", DEFAULT_PROVIDER)
+    provider = PROVIDERS[provider_key]
+    current_model = settings.get("model", provider["default"])
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    buttons = []
+    for model_key, model_id in provider["models"].items():
+        label = f"{'✅ ' if model_key == current_model else ''}{model_key}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"model:{model_key}")])
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def call_provider_api(provider_key: str, model_id: str, messages: list[dict], stream: bool = True) -> AsyncGenerator[tuple[str, dict], None]:
+    """Универсальный вызов API для NVIDIA и Groq."""
+    provider = PROVIDERS[provider_key]
+    api_key = provider["api_key"]
+    api_url = provider["api_url"]
+    
+    if not api_key:
+        raise ValueError(f"API key not set for {provider_key}")
+    
     headers = {
-        "Authorization": f"Bearer {NVIDIA_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
     
-    # Основная модель + фоллбеки
-    models = [
-        "deepseek-ai/deepseek-v4-flash-0731",  # основная
-        "nvidia/llama-3.1-nemotron-70b-instruct",  # фоллбек 1
-        "meta/llama-3.1-8b-instruct",  # фоллбек 2 (быстрая)
-    ]
+    payload = {
+        "model": model_id,
+        "messages": messages,
+        "stream": stream,
+        "temperature": 0.6,
+        "max_tokens": 4096,
+    }
     
-    for attempt, model in enumerate(models):
-        payload = {
-            "model": model,
-            "messages": messages,
-            "stream": stream,
-            "temperature": 0.6,
-            "max_tokens": 4096,
-        }
-        
-        max_retries = 3 if attempt == 0 else 2
-        base_delay = 1.5
-        
-        for retry in range(max_retries):
-            try:
-                async with httpx.AsyncClient(timeout=60.0) as client:
-                    async with client.stream("POST", NVIDIA_API_URL, headers=headers, json=payload) as response:
-                        if response.status_code in (429, 529, 503):
-                            delay = base_delay * (2 ** retry)
-                            logger.warning(f"Model {model} rate limited ({response.status_code}), retry {retry+1}/{max_retries} in {delay}s")
-                            await asyncio.sleep(delay)
-                            continue
-                        
-                        if response.status_code != 200:
-                            error_text = await response.aread()
-                            logger.error(f"NVIDIA API error {response.status_code} on {model}: {error_text}")
-                            break  # пробуем следующую модель
-                        
-                        usage = {}
-                        async for line in response.aiter_lines():
-                            if line.startswith("data: "):
-                                data = line[6:]
-                                if data == "[DONE]":
-                                    return
-                                try:
-                                    import json
-                                    chunk = json.loads(data)
-                                    delta = chunk.get("choices", [{}])[0].get("delta", {})
-                                    content = delta.get("content", "")
-                                    if "usage" in chunk:
-                                        usage = chunk["usage"]
-                                    if content:
-                                        yield content, usage
-                                except json.JSONDecodeError:
-                                    continue
-                        return  # успех
-            except (httpx.TimeoutException, httpx.ConnectError) as e:
-                delay = base_delay * (2 ** retry)
-                logger.warning(f"Network error on {model}: {e}, retry {retry+1}/{max_retries} in {delay}s")
-                await asyncio.sleep(delay)
-                continue
-        
-        logger.warning(f"Model {model} failed after {max_retries} retries, trying next model")
-    
-    # Все модели провалились
-    raise RuntimeError("All NVIDIA models unavailable")
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        async with client.stream("POST", api_url, headers=headers, json=payload) as response:
+            if response.status_code in (429, 529, 503):
+                raise httpx.HTTPStatusError(f"Rate limited", request=response.request, response=response)
+            
+            if response.status_code != 200:
+                error_text = await response.aread()
+                logger.error(f"{provider['name']} API error {response.status_code}: {error_text}")
+                raise httpx.HTTPStatusError(f"API error: {response.status_code}", request=response.request, response=response)
+            
+            usage = {}
+            async for line in response.aiter_lines():
+                if line.startswith("data: "):
+                    data = line[6:]
+                    if data == "[DONE]":
+                        return
+                    try:
+                        import json
+                        chunk = json.loads(data)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {})
+                        content = delta.get("content", "")
+                        if "usage" in chunk:
+                            usage = chunk["usage"]
+                        if content:
+                            yield content, usage
+                    except json.JSONDecodeError:
+                        continue
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -204,6 +264,66 @@ async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{emoji('check')} <b>История {scope} очищена</b>",
         parse_mode=ParseMode.HTML
     )
+
+
+async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает главное меню выбора провайдера/модели."""
+    chat_id = update.message.chat_id
+    settings = get_user_settings(chat_id)
+    provider_key = settings.get("provider", DEFAULT_PROVIDER)
+    model_key = settings.get("model", PROVIDERS[provider_key]["default"])
+    provider_name = PROVIDERS[provider_key]["name"]
+    model_name = model_key
+    
+    text = (
+        f"{emoji('gear')} <b>Настройки модели</b>\n\n"
+        f"Текущий провайдер: <b>{provider_name}</b>\n"
+        f"Текущая модель: <b>{model_name}</b>\n\n"
+        f"Выберите действие:"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=build_main_menu(chat_id))
+
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатий на инлайн-кнопки."""
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    data = query.data
+    
+    if data == "main_menu":
+        await query.edit_message_text(
+            f"{emoji('gear')} <b>Настройки модели</b>\n\nВыберите провайдера:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_main_menu(chat_id)
+        )
+    elif data == "models_menu":
+        await query.edit_message_text(
+            f"{emoji('gear')} <b>Выбор модели</b>\n\nВыберите модель:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_models_menu(chat_id)
+        )
+    elif data.startswith("provider:"):
+        provider_key = data.split(":")[1]
+        if provider_key in PROVIDERS:
+            set_user_provider(chat_id, provider_key)
+            provider_name = PROVIDERS[provider_key]["name"]
+            await query.edit_message_text(
+                f"{emoji('check')} Провайдер изменён на <b>{provider_name}</b>\n\nВыберите модель:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_models_menu(chat_id)
+            )
+    elif data.startswith("model:"):
+        model_key = data.split(":")[1]
+        settings = get_user_settings(chat_id)
+        provider_key = settings.get("provider", DEFAULT_PROVIDER)
+        if model_key in PROVIDERS[provider_key]["models"]:
+            set_user_model(chat_id, model_key)
+            await query.edit_message_text(
+                f"{emoji('check')} Модель изменена на <b>{model_key}</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_models_menu(chat_id)
+            )
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -237,6 +357,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML
     )
 
+    # Получаем текущую модель пользователя
+    provider_key, model_id = get_current_model(chat_id)
+    provider_name = PROVIDERS[provider_key]["name"]
+
     # Строим сообщения с историей
     messages = []
     for h in history:
@@ -250,7 +374,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usage = {}
 
     try:
-        async for token, u in call_nvidia_api(messages):
+        async for token, u in call_provider_api(provider_key, model_id, messages):
             all_parts.append(token)
             full_text = "".join(all_parts)
             if u:
@@ -263,18 +387,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 preview = full_text[-2500:]
                 try:
                     await thinking_msg.edit_text(
-                        f"{emoji('thinking')} <b>Обрабатываю...</b> ⏱ <i>{elapsed}с</i>\n\n"
+                        f"{emoji('thinking')} <b>Обрабатываю...</b> ⏱ <i>{elapsed}с</i> ({provider_name})\n\n"
                         f"<blockquote expandable>{preview}</blockquote>",
                         parse_mode=ParseMode.HTML
                     )
                 except Exception:
                     pass
     except Exception as e:
-        logger.error(f"NVIDIA API call failed: {e}")
+        logger.error(f"API call failed: {e}")
         await thinking_msg.edit_text(
             f"{emoji('error')} <b>Ошибка API</b>\n\n"
             f"<code>{str(e)[:500]}</code>\n\n"
-            f"Попробуйте позже или задайте другой вопрос.",
+            f"Попробуйте позже или смените модель через /menu.",
             parse_mode=ParseMode.HTML
         )
         return
@@ -326,6 +450,8 @@ def main():
     app.post_init = post_init
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear_history))
+    app.add_handler(CommandHandler("menu", menu_command))
+    app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     import asyncio
