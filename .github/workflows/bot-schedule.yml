@@ -1,0 +1,31 @@
+name: Bot Schedule (09:00-01:00 MSK = 16h/day)
+
+on:
+  schedule:
+    # 09:00 MSK = 06:00 UTC
+    - cron: '0 6 * * *'
+    # 01:00 MSK (next day) = 22:00 UTC
+    - cron: '0 22 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: railway/cli@v3
+        with:
+          token: ${{ secrets.RAILWAY_TOKEN }}
+
+      - name: Start Bot (09:00 MSK)
+        if: github.event.schedule == '0 6 * * *'
+        run: railway up --service=numbertree_bot
+
+      - name: Stop Bot (01:00 MSK)
+        if: github.event.schedule == '0 22 * * *'
+        run: railway down --service=numbertree_bot
