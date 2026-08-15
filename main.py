@@ -261,6 +261,249 @@ async def set_level_index(chat_id: int, index: int):
 # chat_id -> { "tasks": [ {level_title, item} ], "quizzes": [ {level_title, item} ] }
 ROADMAP_GENERATED = {}
 
+# ============ INTERVIEW (техсобеседование: база Go-вопросов) ============
+# Курируемая база вопросов в interview.json (варианты ответов MC + открытые,
+# с объяснением). Активные сессии: chat_id -> {"index": int, "category": str|None,
+# "queue": [idx,...], "mode": "mc"|"open"}. "queue" — порядок вопросов.
+INTERVIEW_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "interview.json")
+DEFAULT_INTERVIEW = {"title": "Go · техсобеседование", "description": "", "categories": {}, "questions": []}
+INTERVIEW = DEFAULT_INTERVIEW
+INTERVIEW_SESSIONS = {}
+# Сопоставление полл_id -> {"chat_id", "correct", "category"} для интервью-теста (MC)
+INTERVIEW_QUIZ = {}
+
+
+def load_interview():
+    global INTERVIEW
+    try:
+        with open(INTERVIEW_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        if data and isinstance(data, dict) and isinstance(data.get("questions"), list):
+            INTERVIEW = data
+            return True
+    except Exception as e:
+        logger.error(f"Не удалось загрузить interview.json: {e}")
+    return False
+
+
+load_interview()
+
+
+def _interview_indexed() -> list:
+    return [q for q in INTERVIEW.get("questions", []) if isinstance(q, dict)]
+
+
+def _interview_pick(chat_id: int, category: str | None) -> dict | None:
+    """Возвращает следующий вопрос по категории (или случайно) и индекс.
+    Очередь хранит глобальные индексы в базе вопросов."""
+    all_qs = _interview_indexed()
+    if not all_qs:
+        return None
+    if category == "all":
+        qs = all_qs
+    elif category:
+        qs = [q for q in all_qs if q.get("category") == category]
+        if not qs:
+            return None
+    else:
+        qs = all_qs
+    s = INTERVIEW_SESSIONS.setdefault(chat_id, {"last_idx": -1, "queue": [], "score": 0, "total": 0, "category": None, "ready": False})
+    if s.get("category") != category:
+        # сменилась категория — пересобираем очередь
+        s["queue"] = []
+        s["ready"] = False
+        s["category"] = category
+    if not s.get("ready"):
+        # сохраняем глобальные индексы один раз на длительность сессии
+        s["queue"] = [all_qs.index(q) for q in qs]
+        random.shuffle(s["queue"])
+        s["ready"] = True
+    if not s["queue"]:
+        INTERVIEW_SESSIONS.pop(chat_id, None)
+        return None
+    idx = s["queue"].pop()
+    s["last_idx"] = idx
+    question = all_qs[idx]
+    return question
+
+
+def _interview_question_text(q: dict, pos: int, total: int) -> str:
+    cat_name = INTERVIEW.get("categories", {}).get(q.get("category", ""), q.get("category", ''))
+    mode = "📊 Тест (варианты)" if q.get("type") == "mc" else "✍️ Напиши сам"
+    return (f"🎙️ <b>Техсобеседование</b> · {cat_name}\n"
+            f"{emoji('spark')} Вопрос {pos}/{total} · {mode}")
+
+
+def _interview_stats(chat_id: int) -> tuple[int, int]:
+    sess = INTERVIEW_SESSIONS.get(chat_id)
+    if not sess:
+        return 0, 0
+    return sess.get("score", 0), sess.get("total", 0)
+
+
+def build_interview_menu(chat_id: int):
+    """Меню техсобеса: выбрать категорию, случайный вопрос, все вопросы."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    cat = INTERVIEW.get("categories", {})
+    buttons = []
+    for cid, cname in cat.items():
+        buttons.append([InlineKeyboardButton(cname, callback_data=f"intv:start:{cid}")])
+    buttons.append([InlineKeyboardButton("🎲 Случайный вопрос", callback_data="intv:start:")])
+    buttons.append([InlineKeyboardButton("🧩 Всё подряд (перемешать)", callback_data="intv:start:all")])
+    score, total = _interview_stats(chat_id)
+    buttons.append([InlineKeyboardButton("🏁 Закрыть сессию", callback_data="intv:close")])
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")])
+    header = (
+        f"{emoji('microphone')} <b>{INTERVIEW.get('title', 'Техсобеседование')}</b>\n\n"
+        f"{INTERVIEW.get('description', '')}\n"
+        f"📊 Счёт текущей сессии: <b>{score}/{total}</b>\n"
+        f"Выберите категорию или режим:"
+    )
+    return header, InlineKeyboardMarkup(buttons)
+
+
+async def interview_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Техсобеседование по Go: /interview"""
+    chat_id = update.message.chat_id
+    text, markup = build_interview_menu(chat_id)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
+async def _interview_start(chat_id: int, category: str):
+    """Запускает/продолжает сессию интервью и выдаёт следующий вопрос в нужном формате."""
+    from telegram import Bot
+    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    q = _interview_pick(chat_id, category or None)
+    if not q:
+        await bot.send_message(chat_id, f"{emoji('warning')} Вопросы кончились. Начните заново (/interview).", parse_mode=ParseMode.HTML)
+        return
+    total = len(_interview_indexed())
+    sess = INTERVIEW_SESSIONS.get(chat_id)
+    pos = sess.get("total", 0) + 1
+    header = _interview_question_text(q, pos, total)
+    qtext = f"<b>{q.get('q', '')}</b>"
+
+    if q.get("type") == "mc":
+        options = [str(o) for o in q.get("options", []) if str(o)]
+        correct = int(q.get("correct", -1))
+        if len(options) >= 2 and 0 <= correct < len(options):
+            expl = str(q.get("explanation", "") or "")[:200]
+            poll_kwargs = {
+                "chat_id": chat_id,
+                "question": q.get("q", "")[:255],
+                "options": options[:10],
+                "type": "quiz",
+                "correct_option_id": correct,
+                "is_anonymous": False,
+                "open_period": 120,
+            }
+            if expl:
+                poll_kwargs["explanation"] = expl
+            sent = await bot.send_poll(**poll_kwargs)
+            INTERVIEW_QUIZ[sent.poll.id] = {"chat_id": chat_id, "correct": correct}
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+            nav = InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏭️ Следующий вопрос", callback_data="intv:next")],
+                [InlineKeyboardButton("🏁 Завершить", callback_data="intv:finish")],
+            ])
+            await bot.send_message(
+                chat_id,
+                f"{header}\n\n<i>Полл выше — ответьте в нём. Счёт придёт после выбора.</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=nav,
+            )
+            return
+        # fallback: MC без валидных вариантов -> открытый
+    # открытый вопрос
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    buttons = [
+        [InlineKeyboardButton("👁️ Показать разбор", callback_data="intv:answer")],
+        [InlineKeyboardButton("⏭️ Следующий вопрос", callback_data="intv:next")],
+        [InlineKeyboardButton("🏁 Завершить", callback_data="intv:finish")],
+    ]
+    await bot.send_message(
+        chat_id,
+        f"{header}\n\n{qtext}\n\n{emoji('pencil')} Напишите ответ своими словами — как ответили бы на собеседовании. Затем нажмите «Показать разбор».",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def _interview_show_answer(chat_id: int):
+    """Показывает разбор текущего (последнего) вопроса."""
+    from telegram import Bot
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    sess = INTERVIEW_SESSIONS.get(chat_id)
+    idx = sess.get("last_idx", -1) if sess else -1
+    qs = _interview_indexed()
+    if idx < 0 or idx >= len(qs):
+        await bot.send_message(chat_id, f"{emoji('warning')} Сначала задайте вопрос.", parse_mode=ParseMode.HTML)
+        return
+    q = qs[idx]
+    lines = [f"{emoji('brain')} <b>Разбор</b>\n",
+             f"{emoji('question')} {q.get('q','')}"]
+    if q.get("type") == "mc" and q.get("options"):
+        correct = int(q.get("correct", -1))
+        lines.append("\n<b>Варианты:</b>")
+        for i, o in enumerate(q["options"]):
+            mark = "✅" if i == correct else ""
+            lines.append(f"{i+1}. {o} {mark}")
+    answer = q.get("answer") or next((o for i, o in enumerate(q.get("options", [])) if i == int(q.get("correct", -1))), "")
+    if answer:
+        lines.append(f"\n<b>Правильный ответ:</b> {answer}")
+    if q.get("explanation"):
+        lines.append(f"\n<b>Как правильно ответить:</b>\n{q['explanation']}")
+    buttons = [
+        [InlineKeyboardButton("⏭️ Следующий вопрос", callback_data="intv:next")],
+        [InlineKeyboardButton("🏁 Завершить", callback_data="intv:finish")],
+    ]
+    await bot.send_message(chat_id, "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def _interview_next(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Следующий вопрос той же сессии."""
+    sess = INTERVIEW_SESSIONS.get(chat_id)
+    category = sess.get("category") if sess else None
+    await _interview_start(chat_id, category or "")
+
+
+def _interview_finish(chat_id: int) -> str:
+    sess = INTERVIEW_SESSIONS.get(chat_id)
+    score, total = (sess.get("score", 0), sess.get("total", 0)) if sess else (0, 0)
+    INTERVIEW_SESSIONS.pop(chat_id, None)
+    INTERVIEW_QUIZ.clear()
+    return (f"{emoji('microphone')} <b>Техсобеседование завершено!</b>\n\n"
+            f"📊 Счёт: <b>{score}/{total}</b>\n"
+            f"Начать заново — /interview")
+
+
+async def _interview_poll_result(update: Update, iinfo: dict):
+    """Обрабатывает ответ на MC-полл интервью."""
+    pa = update.poll_answer
+    chat_id = iinfo["chat_id"]
+    correct = iinfo["correct"]
+    chosen = pa.option_ids[0] if pa.option_ids else -1
+    is_right = (chosen == correct)
+    sess = INTERVIEW_SESSIONS.setdefault(chat_id, {"score": 0, "total": 0, "last_idx": -1})
+    sess["total"] += 1
+    if is_right:
+        sess["score"] += 1
+        verdict = f"{emoji('check')} <b>Верно!</b>"
+    else:
+        verdict = f"{emoji('warning')} <b>Неверно.</b> Правильный — вариант {correct+1}."
+    from telegram import Bot
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    buttons = [[InlineKeyboardButton("⏭️ Следующий вопрос", callback_data="intv:next")],
+               [InlineKeyboardButton("🏁 Завершить", callback_data="intv:finish")]]
+    await bot.send_message(
+        chat_id,
+        f"{verdict}\n📊 Счёт: <b>{sess['score']}/{sess['total']}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
 
 def add_generated_task(chat_id: int, level_title: str, item: dict):
     ROADMAP_GENERATED.setdefault(chat_id, {"tasks": [], "quizzes": []})
@@ -378,6 +621,10 @@ def emoji(key: str) -> str:
         "warning": "⚠️",
         "error": "❌",
         "target": "🎯",
+        "microphone": "🎙️",
+        "arrow": "➡️",
+        "pencil": "✍️",
+        "question": "❓",
     }
     custom_id = CUSTOM_EMOJI.get(key)
     if custom_id:
@@ -1013,7 +1260,28 @@ async def stack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
 
-async def learn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _interview_callback(update: Update):
+    """Обработчик кнопок меню техсобеседования."""
+    query = update.callback_query
+    chat_id = query.message.chat_id
+    data = query.data
+    await query.answer()
+    if data == "intv:start:":
+        await _interview_start(chat_id, "")
+    elif data.startswith("intv:start:"):
+        cat = data.split(":", 2)[2]
+        await _interview_start(chat_id, cat)
+    elif data == "intv:next":
+        await _interview_next(chat_id, None)
+    elif data == "intv:answer":
+        await _interview_show_answer(chat_id)
+    elif data in ("intv:finish", "intv:close"):
+        msg = _interview_finish(chat_id)
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        await query.edit_message_text(msg, parse_mode=ParseMode.HTML,
+                                      reply_markup=InlineKeyboardMarkup(
+                                          [[InlineKeyboardButton("🎙️ Начать заново", callback_data="intv:start:")],
+                                           [InlineKeyboardButton("⬅️ Главное меню", callback_data="main_menu")]]))
     """Режим обучения по уровню roadmap: /learn [index]"""
     index = 0
     chat_id = update.message.chat_id
@@ -1191,6 +1459,12 @@ async def _run_learn(chat_id: int, context: ContextTypes.DEFAULT_TYPE, index: in
 async def _poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Проверяет ответ пользователя на учебную викторину и сообщает результат."""
     pa = update.poll_answer
+    # Сопоставление фото poll_id -> данные для интервью-теста
+    iinfo = INTERVIEW_QUIZ.get(pa.poll_id)
+    if iinfo:
+        await _interview_poll_result(update, iinfo)
+        return
+
     info = LEARN_QUIZ.get(pa.poll_id)
     if not info:
         return
@@ -1640,6 +1914,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("stack:"):
         await stack_callback(update, context)
         return
+    elif data.startswith("intv:"):
+        await _interview_callback(update)
+        return
     elif data == "road:menu":
         await query.answer()
         await query.edit_message_text(
@@ -1896,6 +2173,7 @@ def main():
             BotCommand("start", "🚀 Перезапуск бота"),
             BotCommand("roadmap", "🗺️ Roadmap по уровням (стек/языки)"),
             BotCommand("stack", "🧰 Выбрать стек и языки"),
+            BotCommand("interview", "🎙️ Техсобеседование по Go"),
             BotCommand("learn", "🎓 Режим обучения: теория + тест"),
             BotCommand("export", "📤 Экспорт tasks/вопросов в .md для Obsidian"),
         ])
@@ -1914,6 +2192,7 @@ def main():
     app.add_handler(CommandHandler("task", lambda u, c: task_handler(u, c, c.args[0] if c.args else "medium")))
     app.add_handler(CommandHandler("roadmap", roadmap_command))
     app.add_handler(CommandHandler("stack", stack_command))
+    app.add_handler(CommandHandler("interview", interview_command))
     app.add_handler(CommandHandler("learn", learn_command))
     app.add_handler(CommandHandler("export", export_command))
     app.add_handler(CallbackQueryHandler(callback_handler))
