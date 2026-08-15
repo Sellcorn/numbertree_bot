@@ -242,7 +242,9 @@ def md_to_html(text: str) -> str:
         return ""
     # СНАЧАЛА удаляем ВСЕ HTML-теги (модели часто выдают HTML вместо markdown)
     text = re.sub(r'<[^>]+>', '', text)
-    # Затем конвертируем markdown в HTML
+    # Конвертируем markdown-заголовки в жирный текст (Telegram не поддерживает h1-h6)
+    text = re.sub(r'(?m)^(#{1,6})\s+(.+)$', lambda m: f"<b>{m.group(2)}</b>", text)
+    # Затем конвертируем остальной markdown в HTML
     md = markdown.Markdown(
         extensions=["fenced_code", "tables", "nl2br", "sane_lists"],
         output_format="html",
@@ -250,6 +252,9 @@ def md_to_html(text: str) -> str:
     html = md.convert(text)
     html = re.sub(r'<pre><code class="language-(\w+)">', r'<pre><code>', html)
     html = html.replace('<code class="language-">', '<code>')
+    # Заголовки могут всё ещё прийти из markdown-расширений — делаем их жирным текстом
+    html = re.sub(r'<h[1-6][^>]*>', '<b>', html)
+    html = re.sub(r'</h[1-6]>', '</b>', html)
     html = html.replace('<p>', '').replace('</p>', '\n')
     html = html.replace('<br />', '\n').replace('<br>', '\n')
     html = re.sub(r'\n{3,}', '\n\n', html)
