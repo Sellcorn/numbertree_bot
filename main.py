@@ -1282,6 +1282,9 @@ async def _interview_callback(update: Update):
                                       reply_markup=InlineKeyboardMarkup(
                                           [[InlineKeyboardButton("🎙️ Начать заново", callback_data="intv:start:")],
                                            [InlineKeyboardButton("⬅️ Главное меню", callback_data="main_menu")]]))
+
+
+async def learn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Режим обучения по уровню roadmap: /learn [index]"""
     index = 0
     chat_id = update.message.chat_id
