@@ -11,7 +11,7 @@ import httpx
 import markdown
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ChatMemberHandler
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, PollAnswerHandler, filters, ContextTypes, ChatMemberHandler
 from telegram.constants import ParseMode
 
 load_dotenv()
@@ -197,6 +197,13 @@ def md_to_md(text: str) -> str:
 # chat_id -> список сообщений [{user, text, time, user_name}]
 CHAT_MESSAGES = {}
 MAX_CHAT_MESSAGES = 100  # максимум сообщений на чат
+
+# ============ РЕЖИМ ОБУЧЕНИЯ (теория -> тест -> проверка знаний) ============
+# Активная сессия обучения: chat_id -> {"level_index": int, "theory": str}
+LEARN_SESSIONS = {}
+# Сопоставление quiz-poll_id -> {"correct": int, "chat_id": int, "level_index": int}
+# нужно, чтобы проверить знание по ответу на полл-викторину.
+LEARN_QUIZ = {}
 
 # ============ CUSTOM EMOJI CONFIG ============
 # Получите custom_emoji_id из пака https://t.me/addemoji/GameEmoji
@@ -434,6 +441,7 @@ def build_roadmap_level_menu(chat_id: int, index: int):
         if next_topic:
             line.append(InlineKeyboardButton(f"✅ Отметить тему «{next_topic[:40]}»", callback_data=f"road:done:{index}"))
         buttons.append(line)
+    buttons.append([InlineKeyboardButton("🎓 Режим обучения: теория + тест", callback_data=f"road:learn:{index}")])
     buttons.append([InlineKeyboardButton(f"💻 Задача по стеку ({', '.join(level.get('languages', [])[:2])})", callback_data=f"road:task:{index}")])
     buttons.append([InlineKeyboardButton(f"🧠 Викторина по языку", callback_data=f"road:quiz:{index}")])
     buttons.append([InlineKeyboardButton(f"📤 Экспорт уровня (.md)", callback_data=f"road:export:{index}")])
@@ -740,6 +748,31 @@ async def roadmap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def learn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Режим обучения по уровню roadmap: /learn [index]"""
+    index = 0
+    if context.args:
+        try:
+            index = int(context.args[0]) - 1
+        except ValueError:
+            index = 0
+    index = normalize_level_index(index)
+    chat_id = update.message.chat_id
+    await update.message.reply_text(
+        building_learn_start(chat_id, index),
+        parse_mode=ParseMode.HTML
+    )
+
+
+def building_learn_start(chat_id: int, index: int) -> str:
+    """Промежуточное сообщение перед запуском обучения."""
+    level = get_level(index)
+    if not level:
+        return f"{emoji('warning')} Уровень не найден."
+    return (f"{emoji('spark')} Начинаю обучение по уровню <b>{level.get('title', 'Уровень')}</b>.\n"
+            f"{emoji('gear')} Сначала — теория, затем тест.")
+
+
 async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Экспортирует roadmap + сгенерированные задачи/викторины в .md для Obsidian: /export"""
     chat_id = update.message.chat_id
@@ -836,6 +869,95 @@ def mark_topic_done(chat_id: int, index: int) -> tuple[str, int]:
     return f"Отмечено: {tops[next_i]}", len(done)
 
 
+async def _run_learn(chat_id: int, context: ContextTypes.DEFAULT_TYPE, index: int):
+    """Режим обучения: отправляет теорию по уровню roadmap, затем тест (викторину),
+    и по ответу на полл оценивает знание."""
+    index = normalize_level_index(index)
+    level = get_level(index)
+    if not level:
+        from telegram import Bot
+        bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+        await bot.send_message(chat_id, f"{emoji('warning')} Уровень не найден.", parse_mode=ParseMode.HTML)
+        return
+
+    provider_key, model_id = get_current_model(chat_id)
+    langs = ", ".join(level.get("languages", []))
+    stack = level.get("stack", "-")
+    focus = level.get("focus", "")
+
+    theory_prompt = (
+        f"Ты — преподаватель. Составь КРАТКИЙ и структурированный учебный конспект по уровню «{level.get('title', '')}».\n"
+        f"Стек: {stack}. Языки: {langs}. Фокус: {focus}.\n"
+        f"Требования:\n"
+        f"- Пиши на русском, без воды, без HTML-тегов.\n"
+        f"- Используй markdown: **жирный**, списки -, ```код```.\n"
+        f"- Разделы: 1) ключевые понятия, 2) примеры кода, 3) частые ошибки.\n"
+        f"- Объём ~20-30 строк. Это теория перед тестом — дай самое важное."
+    )
+
+    from telegram import Bot
+    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    msg = await bot.send_message(chat_id, f"{emoji('brain')} <b>Готовлю теорию по уровню...</b>", parse_mode=ParseMode.HTML)
+
+    try:
+        parts = []
+        async for token, _ in call_provider_api(provider_key, model_id, [{"role": "user", "content": theory_prompt}], temperature=0.4):
+            parts.append(token)
+        theory = "".join(parts).strip()
+
+        LEARN_SESSIONS[chat_id] = {"level_index": index, "theory": theory}
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg.message_id,
+            text=f"{emoji('spark')} <b>Теория · {level.get('title', 'Уровень')}</b>\n\n{md_to_html(theory)}\n\n"
+                 f"{emoji('gear')} Дальше — тест по этому уровню. Промежуточный счёт будет приходить после каждого ответа.",
+            parse_mode=ParseMode.HTML
+        )
+        # Затем запускаем тест-викторину по этому уровню
+        await _run_quiz(chat_id, context, "programming", level, learn_session=True)
+    except Exception as e:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg.message_id,
+            text=f"{emoji('error')} Ошибка обучения: {e}"
+        )
+
+
+async def _poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверяет ответ пользователя на учебную викторину и сообщает результат."""
+    pa = update.poll_answer
+    info = LEARN_QUIZ.get(pa.poll_id)
+    if not info:
+        return
+    chat_id = info["chat_id"]
+    correct = info["correct"]
+    chosen = pa.option_ids[0] if pa.option_ids else -1
+    is_right = (chosen == correct)
+    # накапливаем счёт в сессии обучения
+    sess = LEARN_SESSIONS.get(chat_id)
+    score = 1 if is_right else 0
+    if sess:
+        sess.setdefault("score", 0)
+        sess.setdefault("total", 0)
+        sess["total"] += 1
+        sess["score"] += score
+
+    from telegram import Bot
+    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    if is_right:
+        verdict = f"{emoji('check')} <b>Верно!</b>"
+    else:
+        verdict = f"{emoji('warning')} <b>Неверно.</b> Правильный ответ — вариант {correct + 1}."
+
+    track = ""
+    if sess and sess.get("total"):
+        track = f"\n\n📊 Счёт сессии: <b>{sess['score']}/{sess['total']}</b>"
+    try:
+        await bot.send_message(chat_id, f"{verdict}{track}", parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.warning(f"poll answer send failed: {e}")
+
+
 # ===== Внутренние функции для команд и callback =====
 
 def _extract_json(text: str):
@@ -904,10 +1026,12 @@ async def _ask_for_json(provider_key: str, model_id: str, prompt: str, parser, l
     return None
 
 
-async def _run_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE, topic: str, level: dict = None):
+async def _run_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE, topic: str, level: dict = None, learn_session: bool = False):
     """Внутренняя функция для запуска викторины.
     Если передан level (из roadmap), вопрос привязывается к языкам/стеку уровня
-    и сохраняется для экспорта в markdown."""
+    и сохраняется для экспорта в markdown.
+    Если learn_session=True — полл-викторина регистрируется для проверки знаний
+    в режиме обучения (ответ пользователя проверяется и начисляется счёт)."""
     provider_key, model_id = get_current_model(chat_id)
 
     topics = {
@@ -963,7 +1087,16 @@ async def _run_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE, topic: str
             }
             if quiz["explanation"]:
                 poll_kwargs["explanation"] = quiz["explanation"]
-            await bot.send_poll(**poll_kwargs)
+            sent = await bot.send_poll(**poll_kwargs)
+            if learn_session:
+                sess = LEARN_SESSIONS.get(chat_id)
+                sess.setdefault("score", 0)
+                sess.setdefault("total", 0)
+                LEARN_QUIZ[sent.poll.id] = {
+                    "correct": quiz["correct"],
+                    "chat_id": chat_id,
+                    "level_index": sess.get("level_index", 0) if sess else 0,
+                }
         else:
             await bot.edit_message_text(
                 chat_id=chat_id,
@@ -1265,6 +1398,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML,
                 reply_markup=build_roadmap_level_menu(chat_id, index)
             )
+        elif action == "learn" and level:
+            await query.answer("🎓 Начинаю обучение...")
+            await _run_learn(chat_id, context, index)
+        elif action == "export":
+            await query.answer(f"{emoji('check')} Экспортирую уровень {index + 1}...")
+            await roadmap_export_level(chat_id, index)
         elif action == "task" and level:
             await query.answer(f"{emoji('brain')} Генерирую задачу по стеку...")
             await _run_task(chat_id, context, level.get("difficulty", "medium"), level)
@@ -1366,7 +1505,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for h in history:
         messages.append({"role": "user", "content": h["user"]})
         messages.append({"role": "assistant", "content": h["assistant"]})
-    messages.append({"role": "user", "content": f"ТЫ ОБЯЗАН ОТВЕЧАТЬ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ. ЗАПРЕЩЕНО ИСПОЛЬЗОВАТЬ HTML-ТЕГИ (<hr>, <strong>, <b>, <ol>, <ul>, <li>, <h1>, <h2>, <h3>, <p>, <div>, <span> И ДРУГИЕ). ИСПОЛЬЗУЙ ТОЛЬКО MARKDOWN: **жирный**, *курсив*, `код`, ```блоки кода```, - списки, 1. нумерованные списки, > цитаты. РАССУЖДАЙ ШАГ ЗА ШАГОМ. ВОПРОС: {user_text}"})
+    messages.append({"role": "user", "content": f"ТЫ ОБЯЗАН ОТВЕЧАТЬ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ. ЗАПРЕЩЕНО ИСПОЛЬЗОВАТЬ HTML-ТЕГИ (<hr>, <strong>, <b>, <ol>, <ul>, <li>, <h1>, <h2>, <h3>, <p>, <div>, <span> И ДРУГИЕ). ИСПОЛЬЗУЙ ТОЛЬКО MARKDOWN: **жирный**, *курсив*, `код`, ```блоки кода```, - списки, 1. нумерованные списки, > цитаты. ОТВЕЧАЙ СРАЗУ И ЧЁТКО, БЕЗ РАССУЖДЕНИЙ. СТРУКТУРИРУЙ ОТВЕТ: короткое вступление, затем разделы/списки/код. ЕСЛИ ЗАДАЛИ ВОПРОС (о викторине, коде или чём угодно) — ОТВЕЧАЙ ПРЯМО НА НЕГО. ВОПРОС: {user_text}"})
 
     all_parts = []
     last_edit_len = 0
@@ -1487,6 +1626,7 @@ def main():
             BotCommand("clear", "🗑 Очистить историю диалога"),
             BotCommand("start", "🚀 Перезапуск бота"),
             BotCommand("roadmap", "🗺️ Roadmap по уровням (стек/языки)"),
+            BotCommand("learn", "🎓 Режим обучения: теория + тест"),
             BotCommand("export", "📤 Экспорт tasks/вопросов в .md для Obsidian"),
         ])
 
@@ -1503,8 +1643,10 @@ def main():
     app.add_handler(CommandHandler("code", lambda u, c: code_help_handler(u, c, c.args[0] if c.args else "explain")))
     app.add_handler(CommandHandler("task", lambda u, c: task_handler(u, c, c.args[0] if c.args else "medium")))
     app.add_handler(CommandHandler("roadmap", roadmap_command))
+    app.add_handler(CommandHandler("learn", learn_command))
     app.add_handler(CommandHandler("export", export_command))
     app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(PollAnswerHandler(_poll_answer))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
 
