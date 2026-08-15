@@ -46,6 +46,153 @@ PROVIDERS = {
 USER_SETTINGS = {}
 DEFAULT_PROVIDER = "qwen"
 
+# ============ ROADMAP (конфигурация уровней) ============
+# Читается из roadmap.json рядом с ботом. Каждый уровень = стек, языки, темы для изучения.
+ROADMAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "roadmap.json")
+DEFAULT_ROADMAP = {
+    "title": "Путь разработчика",
+    "description": "Базовый конфиг. Отредактируйте roadmap.json.",
+    "levels": [],
+}
+ROADMAP = DEFAULT_ROADMAP
+
+
+def load_roadmap():
+    """Загружает roadmap.json в глобальную переменную ROADMAP."""
+    global ROADMAP
+    try:
+        with open(ROADMAP_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        if data and isinstance(data, dict) and isinstance(data.get("levels"), list):
+            ROADMAP = data
+            return True
+    except Exception as e:
+        logger.error(f"Не удалось загрузить roadmap.json: {e}")
+    return False
+
+
+load_roadmap()
+
+# Прогресс пользователя: chat_id -> {"level_index": int, "done_topics": set-ish list}
+# Текущий уровень и пройденные темы хранятся в памяти (по chat_id).
+ROADMAP_PROGRESS = {}
+
+
+def get_level(index: int) -> dict | None:
+    levels = ROADMAP.get("levels", [])
+    if 0 <= index < len(levels):
+        return levels[index]
+    return None
+
+
+def normalize_level_index(index: int) -> int:
+    levels = ROADMAP.get("levels", [])
+    if not levels:
+        return 0
+    return max(0, min(index, len(levels) - 1))
+
+
+def get_progress(chat_id: int) -> dict:
+    """Прогресс пользователя: {level_index, done_topics:[...]}."""
+    if chat_id not in ROADMAP_PROGRESS:
+        ROADMAP_PROGRESS[chat_id] = {"level_index": 0, "done_topics": []}
+    return ROADMAP_PROGRESS[chat_id]
+
+
+def topics_of(level: dict) -> list[str]:
+    focus = level.get("focus", "")
+    return [t.strip() for t in focus.split(",") if t.strip()]
+
+
+def level_topics_done(chat_id: int, level_index: int) -> list[str]:
+    """Список пройденных тем пользователя для данного уровня."""
+    level = get_level(level_index)
+    if not level:
+        return []
+    tops = topics_of(level)
+    prog = get_progress(chat_id)
+    key = f"lvl{level_index}"
+    done_keys = set(prog.get("done_topics", []))
+    return [t for t in tops if f"{key}#{tops.index(t)}" in done_keys]
+
+
+# Времчивое хранилище сгенерированных задач/викторин для экспорта:
+# chat_id -> { "tasks": [ {level_title, item} ], "quizzes": [ {level_title, item} ] }
+ROADMAP_GENERATED = {}
+
+
+def add_generated_task(chat_id: int, level_title: str, item: dict):
+    ROADMAP_GENERATED.setdefault(chat_id, {"tasks": [], "quizzes": []})
+    ROADMAP_GENERATED[chat_id]["tasks"].append({"level": level_title, "item": item})
+
+
+def add_generated_quiz(chat_id: int, level_title: str, item: dict):
+    ROADMAP_GENERATED.setdefault(chat_id, {"tasks": [], "quizzes": []})
+    ROADMAP_GENERATED[chat_id]["quizzes"].append({"level": level_title, "item": item})
+
+
+# ============ EXPORT (экспорт для Obsidian) ============
+def build_export_markdown(chat_id: int) -> str:
+    """Собирает весь roadmap + сгенерированные задачи/викторины в один markdown."""
+    lines = []
+    lines.append(f"# {ROADMAP.get('title', 'Roadmap')}\n")
+    lines.append(f"{ROADMAP.get('description', '')}\n")
+    prog = get_progress(chat_id)
+
+    for idx, level in enumerate(ROADMAP.get("levels", [])):
+        title = level.get("title", f"Уровень {idx + 1}")
+        lines.append(f"## {idx + 1}. {title}\n")
+        lines.append(f"- **Уровень**: {level.get('difficulty', 'medium')}")
+        lines.append(f"- **Стек**: {level.get('stack', '-')}")
+        lines.append(f"- **Языки**: {', '.join(level.get('languages', []))}")
+        lines.append(f"- **Фокус**: {level.get('focus', '')}\n")
+
+        tops = topics_of(level)
+        if tops:
+            lines.append("### Темы для изучения")
+            done = level_topics_done(chat_id, idx)
+            done_keys = [t for t in done]
+            for t in tops:
+                mark = "[x]" if t in done_keys else "[ ]"
+                lines.append(f"- {mark} {t}")
+            lines.append("")
+
+        authored = level.get("tasks", [])
+        if authored:
+            lines.append("### Задачи уровня")
+            for t in authored:
+                lines.append(f"**{t.get('name', 'Задача')}** ({t.get('lang', '-')}): {t.get('desc', '')}\n")
+            lines.append("")
+
+    gen = ROADMAP_GENERATED.get(chat_id, {"tasks": [], "quizzes": []})
+    if gen["tasks"]:
+        lines.append("---\n\n## Задачи, сгенерированные на этой сессии\n")
+        for g in gen["tasks"]:
+            lines.append(f"### {g['level']}\n")
+            lines.append(f"{md_to_md(g['item'].get('problem', g['item'].get('name', '')))}")
+            lines.append("")
+    if gen["quizzes"]:
+        lines.append("---\n\n## Викторины, сгенерированные на этой сессии\n")
+        for g in gen["quizzes"]:
+            item = g["item"]
+            lines.append(f"### {g['level']}\n")
+            lines.append(f"**Вопрос:** {item.get('question', '')}\n")
+            for i, opt in enumerate(item.get("options", [])):
+                marker = "✅" if i == item.get("correct", -1) else " "
+                lines.append(f"{i + 1}. {opt} {marker}")
+            if item.get("explanation"):
+                lines.append(f"*Почему:* {item['explanation']}")
+            lines.append("")
+
+    lines.append(f"\n\n_Экспортировано {datetime.now().strftime('%Y-%m-%d %H:%M')}_")
+    return "\n".join(lines).strip()
+
+
+def md_to_md(text: str) -> str:
+    """Помогает нормализовать LLM-текст: убираем HTML теги, оставляем markdown."""
+    return re.sub(r'<[^>]+>', '', text) if text else ''
+
+
 # Хранилище сообщений чатов для /summary, /judge, /context
 # chat_id -> список сообщений [{user, text, time, user_name}]
 CHAT_MESSAGES = {}
@@ -172,6 +319,7 @@ def build_main_menu(chat_id: int):
         InlineKeyboardButton("💻 Помощь с кодом", callback_data="code_help"),
         InlineKeyboardButton("🎯 Задачи по коду", callback_data="code_tasks"),
     ])
+    buttons.append([InlineKeyboardButton("🗺️ Roadmap по уровням", callback_data="roadmap_menu")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -241,6 +389,85 @@ def build_code_tasks_menu(chat_id: int):
         [InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")],
     ]
     return InlineKeyboardMarkup(buttons)
+
+
+def build_roadmap_menu(chat_id: int):
+    """Меню уровней (roadmap): текущий уровень и продвижение по стеку/языкам."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    levels = ROADMAP.get("levels", [])
+    prog = get_progress(chat_id)
+    buttons = []
+    cur = prog.get("level_index", 0)
+    for idx, level in enumerate(levels):
+        tops = topics_of(level)
+        done = len(level_topics_done(chat_id, idx))
+        total = len(tops)
+        mark = "📍" if idx == cur else ("✅" if done >= total and total > 0 else "⬜")
+        label = f"{mark} {level.get('title', f'Уровень {idx+1}')} ({done}/{total})" if total else f"{mark} {level.get('title', 'Уровень')}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"road:level:{idx}")])
+    buttons.append([InlineKeyboardButton("📤 Экспортировать всё (.md)", callback_data="road:export_all")])
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_roadmap_level_menu(chat_id: int, index: int):
+    """Меню конкретного уровня: задача, викторина, темы, продвижение вперёд."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    index = normalize_level_index(index)
+    level = get_level(index)
+    if not level:
+        return build_roadmap_menu(chat_id)
+    tops = topics_of(level)
+    done = level_topics_done(chat_id, index)
+    done_keys = set(done)
+    # next undone topic
+    next_topic = next((t for t in tops if t not in done_keys), None)
+
+    buttons = []
+    line = []
+    if len(tops) > 0:
+        if next_topic:
+            line.append(InlineKeyboardButton(f"✅ Отметить тему «{next_topic[:40]}»", callback_data=f"road:done:{index}"))
+        buttons.append(line)
+    buttons.append([InlineKeyboardButton(f"💻 Задача по стеку ({', '.join(level.get('languages', [])[:2])})", callback_data=f"road:task:{index}")])
+    buttons.append([InlineKeyboardButton(f"🧠 Викторина по языку", callback_data=f"road:quiz:{index}")])
+    buttons.append([InlineKeyboardButton(f"📤 Экспорт уровня (.md)", callback_data=f"road:export:{index}")])
+    # следующ. уровень
+    next_index = index + 1
+    if next_index < len(ROADMAP.get("levels", [])):
+        buttons.append([InlineKeyboardButton("➡️ Следующий уровень", callback_data=f"road:next:{index}")])
+    else:
+        buttons.append([InlineKeyboardButton("🏁 Дошёл до конца", callback_data="road:finish")])
+    buttons.append([InlineKeyboardButton("⬅️ К списку уровней", callback_data="road:menu")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_roadmap_level_text(chat_id: int, index: int) -> str:
+    """Текст описания уровня с прогрессом по темам."""
+    index = normalize_level_index(index)
+    level = get_level(index)
+    if not level:
+        return f"{emoji('warning')} Уровень не найден."
+    tops = topics_of(level)
+    done = level_topics_done(chat_id, index)
+    done_keys = set(done)
+    lines = [f"{emoji('rocket')} <b>{level.get('title', f'Уровень {index+1}')}</b>"]
+    lines.append(f"{emoji('gear')} Уровень: <b>{level.get('difficulty', 'medium')}</b>")
+    lines.append(f"{emoji('code')} Стек: {level.get('stack', '-')}")
+    lines.append(f"{emoji('spark')} Языки: {', '.join(level.get('languages', []))}")
+    if level.get('focus'):
+        lines.append(f"{emoji('brain')} Фокус: {level['focus']}")
+    if tops:
+        lines.append(f"\n{emoji('check')} <b>Темы ({len(done)}/{len(tops)}):</b>")
+        for i, t in enumerate(tops):
+            mark = "✅" if t in done_keys else "⬜"
+            lines.append(f"{mark} {t}")
+    next_index = index + 1
+    if next_index < len(ROADMAP.get("levels", [])):
+        lines.append(f"\nСледующий: <b>{ROADMAP['levels'][next_index].get('title', '')}</b>")
+    else:
+        lines.append("\n🏁 Это последний уровень.")
+    return "\n".join(lines)
 
 
 async def call_provider_api(provider_key: str, model_id: str, messages: list[dict], stream: bool = True, temperature: float = 0.6) -> AsyncGenerator[tuple[str, dict], None]:
@@ -497,10 +724,111 @@ async def code_help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _run_code_help(update.message.chat_id, context, action, code)
 
 
-async def task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Генерирует задачу по программированию: /task [difficulty]"""
-    difficulty = context.args[0] if context.args else "medium"
-    await _run_task(update.message.chat_id, context, difficulty)
+async def roadmap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает меню уровней: /roadmap"""
+    chat_id = update.message.chat_id
+    await update.message.reply_text(
+        f"{emoji('rocket')} <b>Roadmap по стеку и языкам</b>\n\n"
+        f"{ROADMAP.get('description', '')}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_roadmap_menu(chat_id)
+    )
+
+
+async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Экспортирует roadmap + сгенерированные задачи/викторины в .md для Obsidian: /export"""
+    chat_id = update.message.chat_id
+    md = build_export_markdown(chat_id)
+    if not md:
+        await update.message.reply_text(f"{emoji('warning')} Пока нечего экспортировать.")
+        return
+    from io import BytesIO
+    filename = f"roadmap_{chat_id}_{datetime.now().strftime('%Y%m%d_%H%M')}.md"
+    bio = BytesIO(md.encode("utf-8"))
+    bio.name = filename
+    await update.message.reply_document(
+        document=bio,
+        caption=f"{emoji('check')} <b>Экспорт для Obsidian</b>\n{txt_fname(filename)}",
+        parse_mode=ParseMode.HTML
+    )
+
+
+def txt_fname(fname: str) -> str:
+    return f"Файл: <code>{fname}</code>"
+
+
+def build_export_with_level(chat_id: int, index: int) -> str:
+    """Экспорт одного уровня в markdown."""
+    level = get_level(index)
+    if not level:
+        return ""
+    lines = []
+    lines.append(f"# {index + 1}. {level.get('title', f'Уровень {index+1}')}")
+    lines.append(f"- **Уровень**: {level.get('difficulty', 'medium')}")
+    lines.append(f"- **Стек**: {level.get('stack', '-')}")
+    lines.append(f"- **Языки**: {', '.join(level.get('languages', []))}")
+    lines.append(f"- **Фокус**: {level.get('focus', '')}\n")
+    tops = topics_of(level)
+    if tops:
+        lines.append("### Темы")
+        done = level_topics_done(chat_id, index)
+        done_keys = set(done)
+        for t in tops:
+            mark = "[x]" if t in done_keys else "[ ]"
+            lines.append(f"- {mark} {t}")
+    authored = level.get("tasks", [])
+    if authored:
+        lines.append("\n### Задачи")
+        for t in authored:
+            lines.append(f"**{t.get('name','Задача')}** ({t.get('lang','-')}): {t.get('desc','')}")
+    for g in ROADMAP_GENERATED.get(chat_id, {"tasks": [], "quizzes": []}).get("tasks", []):
+        if g.get("level") == level.get("title"):
+            lines.append(f"\n**Сгенерировано:**\n{g['item'].get('problem', '')}")
+    return "\n".join(lines)
+
+
+async def roadmap_export_level(chat_id: int, index: int):
+    """Отправляет уровень как .md файл."""
+    from io import BytesIO
+    from telegram import Bot
+    md = build_export_with_level(chat_id, index)
+    if not md:
+        return
+    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    bio = BytesIO(md.encode("utf-8"))
+    bio.name = f"level_{index + 1}.md"
+    await bot.send_document(chat_id=chat_id, document=bio, caption=f"{emoji('check')} Экспорт уровня {index + 1}")
+
+
+async def roadmap_export_all(chat_id: int):
+    """Отправляет полный roadmap как .md файл."""
+    from io import BytesIO
+    from telegram import Bot
+    md = build_export_markdown(chat_id)
+    if not md:
+        return
+    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    bio = BytesIO(md.encode("utf-8"))
+    bio.name = "roadmap.md"
+    await bot.send_document(chat_id=chat_id, document=bio, caption=f"{emoji('check')} Экспорт всего roadmap (.md)")
+
+
+def mark_topic_done(chat_id: int, index: int) -> tuple[str, int]:
+    """Отмечает следующую неотмеченную тему уровня. Возвращает (задача, прогресс)."""
+    index = normalize_level_index(index)
+    level = get_level(index)
+    if not level:
+        return "Уровень не найден", 0
+    tops = topics_of(level)
+    prog = get_progress(chat_id)
+    done = set(prog.get("done_topics", []))
+    key_prefix = f"lvl{index}#"
+    next_i = next((i for i, t in enumerate(tops) if f"{key_prefix}{i}" not in done), None)
+    if next_i is None:
+        return "Все темы этого уровня уже отмечены. Переходите на следующий.", len(done)
+    done.add(f"{key_prefix}{next_i}")
+    prog["done_topics"] = sorted(done)
+    return f"Отмечено: {tops[next_i]}", len(done)
 
 
 # ===== Внутренние функции для команд и callback =====
@@ -571,8 +899,10 @@ async def _ask_for_json(provider_key: str, model_id: str, prompt: str, parser, l
     return None
 
 
-async def _run_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE, topic: str):
-    """Внутренняя функция для запуска викторины."""
+async def _run_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE, topic: str, level: dict = None):
+    """Внутренняя функция для запуска викторины.
+    Если передан level (из roadmap), вопрос привязывается к языкам/стеку уровня
+    и сохраняется для экспорта в markdown."""
     provider_key, model_id = get_current_model(chat_id)
 
     topics = {
@@ -583,6 +913,14 @@ async def _run_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE, topic: str
         "random": "случайная тема",
     }
     topic_name = topics.get(topic, topic)
+    level_title = None
+
+    if level:
+        level_title = level.get("title", "Уровень")
+        langs = ", ".join(level.get("languages", []))
+        topic_name = (f"программирование ({topic_name}), с уклоном в конкретный стек: "
+                      f"{level.get('stack', '-')}, языки: {langs}. "
+                      f"Вопрос должен проверять знание именно этого стека/языков уровня «{level_title}»")
 
     prompt = (
         f"Ты — составитель викторин. Придумай ОДИН новый вопрос викторины на тему: {topic_name}.\n"
@@ -608,6 +946,8 @@ async def _run_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE, topic: str
     try:
         quiz = await _ask_for_json(provider_key, model_id, prompt, _parse_quiz, "quiz")
         if quiz:
+            if level and level_title:
+                add_generated_quiz(chat_id, level_title, quiz)
             await bot.delete_message(chat_id, msg.message_id)
             poll_kwargs = {
                 "chat_id": chat_id,
@@ -724,8 +1064,9 @@ async def _run_code_help(chat_id: int, context: ContextTypes.DEFAULT_TYPE, actio
         )
 
 
-async def _run_task(chat_id: int, context: ContextTypes.DEFAULT_TYPE, difficulty: str):
-    """Внутренняя функция для генерации задачи."""
+async def _run_task(chat_id: int, context: ContextTypes.DEFAULT_TYPE, difficulty: str, level: dict = None):
+    """Внутренняя функция для генерации задачи. Если передан level (из roadmap),
+    задача привязывается к конкретному стеку/языкам уровня и сохраняется для экспорта."""
     provider_key, model_id = get_current_model(chat_id)
     
     difficulties = {
@@ -734,15 +1075,28 @@ async def _run_task(chat_id: int, context: ContextTypes.DEFAULT_TYPE, difficulty
         "hard": "Senior уровень: сложные алгоритмы, системное проектирование, конкурентность",
         "random": "случайная сложность",
     }
+
+    lang_note = ""
+    stack_note = ""
+    level_title = None
+    if level:
+        level_title = level.get("title", "Уровень")
+        langs = level.get("languages", [])
+        stack_note = f"\nТребуемый стек: {level.get('stack', '-')}."
+        if langs:
+            lang_note = (f"\nЗадача обязательно должна решаться на одном из этих языков: {', '.join(langs)}. "
+                         f"Выбери конкретный язык из списка и укажи его. Решение пиши именно на этом языке.")
     
     prompt = (
-        f"Создай задачу по программированию уровня: {difficulties.get(difficulty, difficulties['medium'])}.\n"
+        f"Создай задачу по программированию уровня: {difficulties.get(difficulty, difficulties['medium'])}."
+        f"{stack_note}"
+        f"{lang_note}\n"
         f"Формат:\n"
         f"1. Название задачи\n"
         f"2. Условие (входные/выходные данные, ограничения)\n"
         f"3. Пример ввода/вывода\n"
         f"4. Подсказка (алгоритм)\n"
-        f"5. Решение на Python с комментариями\n\n"
+        f"5. Решение на выбранном языке с комментариями\n\n"
         f"На русском языке."
     )
     
@@ -755,11 +1109,15 @@ async def _run_task(chat_id: int, context: ContextTypes.DEFAULT_TYPE, difficulty
         async for token, _ in call_provider_api(provider_key, model_id, [{"role": "user", "content": prompt}]):
             parts.append(token)
         result = "".join(parts).strip()
-        
+
+        if level and level_title:
+            add_generated_task(chat_id, level_title, {"level_label": f"Задача · {level_title}", "problem": result})
+
+        title = f"Задача ({difficulty}) · {level_title}" if level_title else f"Задача ({difficulty})"
         await bot.edit_message_text(
             chat_id=chat_id,
             message_id=msg.message_id,
-            text=f"{emoji('brain')} <b>Задача ({difficulty}):</b>\n\n{md_to_html(result)}",
+            text=f"{emoji('brain')} <b>{title}:</b>\n\n{md_to_html(result)}",
             parse_mode=ParseMode.HTML
         )
     except Exception as e:
@@ -795,7 +1153,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     
     # Быстрые переходы меню — отвечаем сразу
-    if data in ("main_menu", "models_menu", "quiz_menu", "poll_menu", "code_help", "code_tasks"):
+    if data in ("main_menu", "models_menu", "quiz_menu", "poll_menu", "code_help", "code_tasks", "roadmap_menu"):
         await query.answer()
     
     if data == "main_menu":
@@ -864,6 +1222,71 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
             reply_markup=build_code_tasks_menu(chat_id)
         )
+    elif data == "roadmap_menu":
+        await query.answer()
+        await query.edit_message_text(
+            f"{emoji('rocket')} <b>Roadmap по стеку и языкам</b>\n\n"
+            f"{ROADMAP.get('description', '')}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_roadmap_menu(chat_id)
+        )
+    elif data == "road:menu":
+        await query.answer()
+        await query.edit_message_text(
+            f"{emoji('rocket')} <b>Roadmap по стеку и языкам</b>\n\n"
+            f"{ROADMAP.get('description', '')}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_roadmap_menu(chat_id)
+        )
+    elif data == "road:export_all":
+        await query.answer(f"{emoji('check')} Отправляю roadmap...")
+        await roadmap_export_all(chat_id)
+    elif data == "road:finish":
+        await query.answer("🏁 Все уровни пройдены!")
+        await query.edit_message_text(
+            f"{emoji('rocket')} 🏁 <b>Вы прошли весь roadmap!</b>\n\n"
+            f"Можно повторить уровни или экспортировать результат в Obsidian.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_roadmap_menu(chat_id)
+        )
+    elif data.startswith("road:"):
+        _, action, raw_index = data.split(":", 2)
+        index = normalize_level_index(int(raw_index))
+        level = get_level(index)
+        if action == "level":
+            await query.answer()
+            await query.edit_message_text(
+                build_roadmap_level_text(chat_id, index),
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_roadmap_level_menu(chat_id, index)
+            )
+        elif action == "task" and level:
+            await query.answer(f"{emoji('brain')} Генерирую задачу по стеку...")
+            await _run_task(chat_id, context, level.get("difficulty", "medium"), level)
+        elif action == "quiz" and level:
+            await query.answer("🧠 Генерирую викторину по языку...")
+            await _run_quiz(chat_id, context, "programming", level)
+        elif action == "export":
+            await query.answer(f"{emoji('check')} Экспортирую уровень {index + 1}...")
+            await roadmap_export_level(chat_id, index)
+        elif action == "done":
+            msg, ndone = mark_topic_done(chat_id, index)
+            await query.answer(f"{emoji('check')} {msg}")
+            await query.edit_message_text(
+                build_roadmap_level_text(chat_id, index),
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_roadmap_level_menu(chat_id, index)
+            )
+        elif action == "next":
+            prog = get_progress(chat_id)
+            prog["level_index"] = index + 1
+            nxt = normalize_level_index(index + 1)
+            await query.answer(f"Переходим к уровню {nxt + 1}")
+            await query.edit_message_text(
+                build_roadmap_level_text(chat_id, nxt),
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_roadmap_level_menu(chat_id, nxt)
+            )
     elif data.startswith("quiz:"):
         topic = data.split(":")[1]
         await _run_quiz(chat_id, context, topic)
@@ -1058,6 +1481,8 @@ def main():
             BotCommand("menu", "🤖 Выбрать модель и провайдера"),
             BotCommand("clear", "🗑 Очистить историю диалога"),
             BotCommand("start", "🚀 Перезапуск бота"),
+            BotCommand("roadmap", "🗺️ Roadmap по уровням (стек/языки)"),
+            BotCommand("export", "📤 Экспорт tasks/вопросов в .md для Obsidian"),
         ])
 
     app.post_init = post_init
@@ -1072,6 +1497,8 @@ def main():
     app.add_handler(CommandHandler("poll", lambda u, c: poll_handler(u, c, c.args[0] if c.args else "opinion")))
     app.add_handler(CommandHandler("code", lambda u, c: code_help_handler(u, c, c.args[0] if c.args else "explain")))
     app.add_handler(CommandHandler("task", lambda u, c: task_handler(u, c, c.args[0] if c.args else "medium")))
+    app.add_handler(CommandHandler("roadmap", roadmap_command))
+    app.add_handler(CommandHandler("export", export_command))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))

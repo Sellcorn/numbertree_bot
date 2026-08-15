@@ -1,0 +1,71 @@
+{
+  "title": "Путь разработчика (стек и языки)",
+  "description": "Двигайтесь по уровням. Каждый уровень закрывает конкретный стек и языки. Задачи и викторины генерируются под языки уровня.",
+  "levels": [
+    {
+      "id": "junior",
+      "title": "Junior: основы",
+      "difficulty": "easy",
+      "stack": "Frontend: HTML/CSS · Backend: Python",
+      "languages": ["Python", "JavaScript", "SQL"],
+      "focus": "базовый синтаксис, типы, условия, циклы, функции",
+      "tasks": [
+        {
+          "name": "FizzBuzz на Python",
+          "desc": "Вывести числа от 1 до N, где кратные 3 → Fizz, 5 → Buzz, 3 и 5 → FizzBuzz. Ограничения: N (1..100), O(n).",
+          "lang": "Python"
+        },
+        {
+          "name": "Реверс строки без reversed",
+          "desc": "Развернуть строку на JavaScript без встроенных методов. Пример: 'abc' → 'cba'.",
+          "lang": "JavaScript"
+        },
+        {
+          "name": "Второй максимум SQL",
+          "desc": "Написать запрос, возвращающий второй по величине salary из таблицы employees без использования LIMIT/OFFSET.",
+          "lang": "SQL"
+        }
+      ]
+    },
+    {
+      "id": "middle",
+      "title": "Middle: структуры данных",
+      "difficulty": "medium",
+      "stack": "Backend: Python/FastAPI · Frontend: React TS",
+      "languages": ["Python", "TypeScript"],
+      "focus": "структуры данных, сложность, ООП, REST, типизация",
+      "tasks": [
+        {
+          "name": "Хеш-таблица вручную",
+          "desc": "Реализовать HashMap на Python с открытой адресацией (put/get/delete). Амортизированная сложность O(1).",
+          "lang": "Python"
+        },
+        {
+          "name": "Generic стека на TS",
+          "desc": "Написать TypeScript-класс Stack<T> с push/pop/peek/isEmpty и типизированными методами.",
+          "lang": "TypeScript"
+        }
+      ]
+    },
+    {
+      "id": "senior",
+      "title": "Senior: системы",
+      "difficulty": "hard",
+      "stack": "Backend: Go · Infra: Docker/K8s",
+      "languages": ["Go", "Golang", "Docker"],
+      "focus": "конкурентность, goroutines, системное проектирование, деплой",
+      "tasks": [
+        {
+          "name": "Worker pool на Go",
+          "desc": "Реализовать пул воркеров на Go с каналами, ограничением конкурентности и graceful shutdown.",
+          "lang": "Go"
+        },
+        {
+          "name": "Graceful shutdown Docker",
+          "desc": "Описать Dockerfile и signal-handling в Go для корректного остановки контейнера (SIGTERM).",
+          "lang": "Go"
+        }
+      ]
+    }
+  ]
+}
