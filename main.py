@@ -1,6 +1,8 @@
 import os
 import asyncio
+import json
 import logging
+import random
 import re
 from datetime import datetime
 from typing import AsyncGenerator
@@ -29,32 +31,20 @@ MAX_HISTORY_GROUP = 3      # группы: короткая память на п
 
 # Настройки провайдеров и моделей
 PROVIDERS = {
-    "groq": {
-        "name": "Groq",
-        "api_key": os.getenv("GROQ_API_KEY"),
-        "api_url": "https://api.groq.com/openai/v1/chat/completions",
+    "qwen": {
+        "name": "Qwen",
+        "api_key": os.getenv("QWEN_API_KEY"),
+        "api_url": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
         "models": {
-            "llama-3.3-70b": "llama-3.3-70b-versatile",
-            "llama-3.1-8b": "llama-3.1-8b-instant",
-            "mixtral-8x7b": "mixtral-8x7b-32768",
-            "gemma2-9b": "gemma2-9b-it",
+            "qwen3.6-flash": "qwen3.6-flash",
         },
-        "default": "llama-3.3-70b",
-    },
-    "nvidia": {
-        "name": "NVIDIA",
-        "api_key": os.getenv("NVIDIA_API_KEY"),
-        "api_url": "https://integrate.api.nvidia.com/v1/chat/completions",
-        "models": {
-            "deepseek-v4-flash": "deepseek-ai/deepseek-v4-flash-0731",
-        },
-        "default": "deepseek-v4-flash",
+        "default": "qwen3.6-flash",
     },
 }
 
 # Пользовательские настройки: chat_id -> {provider, model}
 USER_SETTINGS = {}
-DEFAULT_PROVIDER = "groq"
+DEFAULT_PROVIDER = "qwen"
 
 # Хранилище сообщений чатов для /summary, /judge, /context
 # chat_id -> список сообщений [{user, text, time, user_name}]
@@ -253,8 +243,8 @@ def build_code_tasks_menu(chat_id: int):
     return InlineKeyboardMarkup(buttons)
 
 
-async def call_provider_api(provider_key: str, model_id: str, messages: list[dict], stream: bool = True) -> AsyncGenerator[tuple[str, dict], None]:
-    """Универсальный вызов API для NVIDIA и Groq."""
+async def call_provider_api(provider_key: str, model_id: str, messages: list[dict], stream: bool = True, temperature: float = 0.6) -> AsyncGenerator[tuple[str, dict], None]:
+    """Универсальный вызов API провайдера."""
     provider = PROVIDERS[provider_key]
     api_key = provider["api_key"]
     api_url = provider["api_url"]
@@ -271,7 +261,7 @@ async def call_provider_api(provider_key: str, model_id: str, messages: list[dic
         "model": model_id,
         "messages": messages,
         "stream": stream,
-        "temperature": 0.6,
+        "temperature": temperature,
         "max_tokens": 4096,
     }
     
@@ -328,7 +318,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 continue  # Не приветствуем самого бота
             await update.message.reply_text(
                 f"{emoji('rocket')} <b>Привет, {member.mention_html()}!</b>\n\n"
-                f"{emoji('brain')} Я ИИ-ассистент с выбором моделей (NVIDIA / Groq).\n"
+                f"{emoji('brain')} Я ИИ-ассистент на базе Qwen 3.6 Flash.\n"
                 f"{emoji('gear')} Отвечаю по @numbertree_bot или reply.\n\n"
                 f"Выберите модель и провайдера:",
                 parse_mode=ParseMode.HTML,
@@ -515,10 +505,76 @@ async def task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===== Внутренние функции для команд и callback =====
 
+def _extract_json(text: str):
+    """Достаёт JSON-объект из ответа LLM (игнорирует markdown-обёртки и лишний текст)."""
+    if not text:
+        return None
+    text = text.strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        return json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+
+
+def _parse_quiz(text: str):
+    """Парсит JSON викторины от LLM. Возвращает None, если ответ невалидный."""
+    data = _extract_json(text)
+    if not isinstance(data, dict):
+        return None
+    question = str(data.get("question", "")).strip()[:300]
+    options = [str(o).strip()[:100] for o in data.get("options", []) if str(o).strip()]
+    options = options[:10]
+    if not question or len(options) < 2:
+        return None
+    try:
+        correct = int(data.get("correct", -1))
+    except (TypeError, ValueError):
+        return None
+    if not 0 <= correct < len(options):
+        return None
+    explanation = str(data.get("explanation", "") or "").strip()[:200]
+    return {"question": question, "options": options, "correct": correct, "explanation": explanation}
+
+
+def _parse_poll(text: str):
+    """Парсит JSON опроса от LLM. Возвращает None, если ответ невалидный."""
+    data = _extract_json(text)
+    if not isinstance(data, dict):
+        return None
+    question = str(data.get("question", "")).strip()[:300]
+    options = [str(o).strip()[:100] for o in data.get("options", []) if str(o).strip()]
+    options = options[:10]
+    if not question or len(options) < 2:
+        return None
+    return {"question": question, "options": options}
+
+
+async def _ask_for_json(provider_key: str, model_id: str, prompt: str, parser, label: str):
+    """Запрашивает у LLM структурированный JSON; при невалидном ответе повторяет ещё раз."""
+    for attempt in range(2):
+        p = prompt
+        if attempt > 0:
+            p += ("\n\nВАЖНО: предыдущий ответ не распознан. Верни СТРОГО один валидный JSON-объект — "
+                  "без markdown, без блоков кода, без пояснений до и после.")
+        parts = []
+        async for token, _ in call_provider_api(provider_key, model_id, [{"role": "user", "content": p}], temperature=0.9):
+            parts.append(token)
+        parsed = parser("".join(parts))
+        if parsed:
+            return parsed
+        logger.warning(f"{label}: невалидный JSON от модели (попытка {attempt + 1}): {''.join(parts)[:300]}")
+    return None
+
+
 async def _run_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE, topic: str):
     """Внутренняя функция для запуска викторины."""
     provider_key, model_id = get_current_model(chat_id)
-    
+
     topics = {
         "general": "общие знания",
         "programming": "программирование",
@@ -527,55 +583,47 @@ async def _run_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE, topic: str
         "random": "случайная тема",
     }
     topic_name = topics.get(topic, topic)
-    
+
     prompt = (
-        f"Создай 1 вопрос викторины на тему: {topic_name}. "
-        f"Формат: вопрос, 4 варианта ответа (A, B, C, D), правильный ответ. "
-        f"На русском языке."
+        f"Ты — составитель викторин. Придумай ОДИН новый вопрос викторины на тему: {topic_name}.\n"
+        f"Номер раунда: {random.randint(1, 999999)} — используй его как зерно случайности: "
+        f"каждый раунд обязан отличаться, выбирай новую узкую подтему и нестандартный факт, "
+        f"не повторяй заезженные шаблонные вопросы.\n"
+        f"Строгие правила:\n"
+        f"1. Вопрос однозначный и фактически корректный, на русском языке.\n"
+        f"2. Ровно 4 варианта ответа, из них РОВНО ОДИН правильный.\n"
+        f"3. Правильный ответ обязан быть объективно верным — перепроверь факт перед отправкой "
+        f"(например, язык программирования для веба — JavaScript, а не Python).\n"
+        f"4. Расположи правильный ответ на случайной позиции, а не всегда первым.\n"
+        f"Верни ТОЛЬКО один валидный JSON-объект, без markdown и пояснений:\n"
+        f'{{"question": "текст вопроса", "options": ["вариант 1", "вариант 2", "вариант 3", "вариант 4"], '
+        f'"correct": N, "explanation": "почему этот ответ правильный, 1-2 предложения"}}\n'
+        f"correct — индекс правильного варианта от 0 до 3."
     )
-    
-    # Отправляем временное сообщение через bot напрямую
+
     from telegram import Bot
     bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
     msg = await bot.send_message(chat_id, f"{emoji('brain')} <b>Генерирую викторину...</b>", parse_mode=ParseMode.HTML)
-    
+
     try:
-        parts = []
-        async for token, _ in call_provider_api(provider_key, model_id, [{"role": "user", "content": prompt}]):
-            parts.append(token)
-        text = "".join(parts).strip()
-        
-        # Парсим вопрос и варианты для создания опроса
-        lines = text.split("\n")
-        question = ""
-        options = []
-        correct_option = 0
-        
-        for i, line in enumerate(lines):
-            line = line.strip()
-            if line and not question:
-                question = line.replace("Вопрос:", "").replace("Вопрос ", "").strip()
-            elif line.startswith(("A)", "B)", "C)", "D)", "А)", "Б)", "В)", "Г)")):
-                options.append(line[2:].strip())
-                if "правиль" in line.lower() or "✓" in line or "✅" in line:
-                    correct_option = len(options) - 1
-        
-        if len(options) >= 2:
+        quiz = await _ask_for_json(provider_key, model_id, prompt, _parse_quiz, "quiz")
+        if quiz:
             await bot.delete_message(chat_id, msg.message_id)
-            await bot.send_poll(
-                chat_id=chat_id,
-                question=question or "Вопрос викторины",
-                options=options[:4],
-                type="quiz",
-                correct_option_id=min(correct_option, len(options) - 1),
-                explanation="Правильный ответ будет показан после голосования"
-            )
+            poll_kwargs = {
+                "chat_id": chat_id,
+                "question": quiz["question"],
+                "options": quiz["options"],
+                "type": "quiz",
+                "correct_option_id": quiz["correct"],
+            }
+            if quiz["explanation"]:
+                poll_kwargs["explanation"] = quiz["explanation"]
+            await bot.send_poll(**poll_kwargs)
         else:
             await bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=msg.message_id,
-                text=f"{emoji('brain')} <b>Викторина:</b>\n\n{md_to_html(text)}",
-                parse_mode=ParseMode.HTML
+                text=f"{emoji('warning')} Модели не удалось составить корректный вопрос. Попробуйте ещё раз."
             )
     except Exception as e:
         await bot.edit_message_text(
@@ -588,45 +636,35 @@ async def _run_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE, topic: str
 async def _run_poll(chat_id: int, context: ContextTypes.DEFAULT_TYPE, poll_type: str):
     """Внутренняя функция для создания опроса."""
     provider_key, model_id = get_current_model(chat_id)
-    
+
     types = {
-        "opinion": "создай опрос для сбора мнений по теме, варианты: полностью согласен / скорее согласен / нейтрально / скорее нет / полностью не согласен",
-        "compare": "создай опрос для сравнения 2-3 вариантов, укажи плюсы/минусы каждого",
-        "priority": "создай опрос для определения приоритетов, варианты: высокий / средний / низкий приоритет",
+        "opinion": "опрос для сбора мнений по актуальной теме; варианты ответа: Полностью согласен / Скорее согласен / Нейтрально / Скорее нет / Полностью не согласен",
+        "compare": "опрос, в котором участники выбирают лучший из 3-5 вариантов (технологии, инструменты, подходы)",
+        "priority": "опрос о приоритетах — что важнее; варианты ответа: Высокий приоритет / Средний приоритет / Низкий приоритет",
     }
-    
+
     prompt = (
-        f"{types.get(poll_type, types['opinion'])}. "
-        f"Верни: вопрос опроса и 3-5 вариантов ответа. На русском."
+        f"Ты — составитель опросов. Придумай ОДИН новый оригинальный опрос.\n"
+        f"Номер раунда: {random.randint(1, 999999)} — используй его как зерно случайности: "
+        f"каждый опрос обязан отличаться, выбирай новую тему, не повторяйся.\n"
+        f"Тип: {types.get(poll_type, types['opinion'])}.\n"
+        f"Правила: вопрос короткий и понятный, на русском; 3-6 вариантов ответа без дублей.\n"
+        f"Верни ТОЛЬКО один валидный JSON-объект, без markdown и пояснений:\n"
+        f'{{"question": "текст вопроса", "options": ["вариант 1", "вариант 2", "вариант 3"]}}'
     )
-    
+
     from telegram import Bot
     bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
     msg = await bot.send_message(chat_id, f"{emoji('code')} <b>Создаю опрос...</b>", parse_mode=ParseMode.HTML)
-    
+
     try:
-        parts = []
-        async for token, _ in call_provider_api(provider_key, model_id, [{"role": "user", "content": prompt}]):
-            parts.append(token)
-        text = "".join(parts).strip()
-        
-        # Парсим для создания опроса
-        lines = text.split("\n")
-        question = lines[0] if lines else "Опрос"
-        options = []
-        for line in lines[1:]:
-            line = line.strip()
-            if line.startswith(("1.", "2.", "3.", "4.", "5.", "-", "•", "A)", "B)", "C)")):
-                opt = line.lstrip("12345.-•ABC) ").strip()
-                if opt:
-                    options.append(opt)
-        
-        if len(options) >= 2:
+        poll = await _ask_for_json(provider_key, model_id, prompt, _parse_poll, "poll")
+        if poll:
             await bot.delete_message(chat_id, msg.message_id)
             await bot.send_poll(
                 chat_id=chat_id,
-                question=question,
-                options=options[:10],
+                question=poll["question"],
+                options=poll["options"],
                 type="regular",
                 allows_multiple_answers=False
             )
@@ -634,8 +672,7 @@ async def _run_poll(chat_id: int, context: ContextTypes.DEFAULT_TYPE, poll_type:
             await bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=msg.message_id,
-                text=f"{emoji('code')} <b>Опрос:</b>\n\n{md_to_html(text)}",
-                parse_mode=ParseMode.HTML
+                text=f"{emoji('warning')} Модели не удалось составить опрос. Попробуйте ещё раз."
             )
     except Exception as e:
         await bot.edit_message_text(
