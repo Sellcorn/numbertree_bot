@@ -383,7 +383,7 @@ async def _interview_start(chat_id: int, category: str):
     sess = INTERVIEW_SESSIONS.get(chat_id)
     pos = sess.get("total", 0) + 1
     header = _interview_question_text(q, pos, total)
-    qtext = f"<b>{q.get('q', '')}</b>"
+    qtext = f"<b>{md_to_html(q.get('q', ''))}</b>"
 
     if q.get("type") == "mc":
         options = [str(o) for o in q.get("options", []) if str(o)]
@@ -444,18 +444,19 @@ async def _interview_show_answer(chat_id: int):
         return
     q = qs[idx]
     lines = [f"{emoji('brain')} <b>Разбор</b>\n",
-             f"{emoji('question')} {q.get('q','')}"]
+             f"{emoji('question')} {md_to_html(q.get('q',''))}"]
     if q.get("type") == "mc" and q.get("options"):
         correct = int(q.get("correct", -1))
         lines.append("\n<b>Варианты:</b>")
         for i, o in enumerate(q["options"]):
             mark = "✅" if i == correct else ""
-            lines.append(f"{i+1}. {o} {mark}")
-    answer = q.get("answer") or next((o for i, o in enumerate(q.get("options", [])) if i == int(q.get("correct", -1))), "")
+            lines.append(f"{i+1}. {md_to_html(str(o))} {mark}")
+    correct_answer = next(((i, o) for i, o in enumerate(q.get("options", [])) if i == int(q.get("correct", -1))), (-1, ""))
+    answer = q.get("answer") or correct_answer[1]
     if answer:
-        lines.append(f"\n<b>Правильный ответ:</b> {answer}")
+        lines.append(f"\n<b>Правильный ответ:</b> {md_to_html(str(answer))}")
     if q.get("explanation"):
-        lines.append(f"\n<b>Как правильно ответить:</b>\n{q['explanation']}")
+        lines.append(f"\n<b>Как правильно ответить:</b>\n{md_to_html(q['explanation'])}")
     buttons = [
         [InlineKeyboardButton("⏭️ Следующий вопрос", callback_data="intv:next")],
         [InlineKeyboardButton("🏁 Завершить", callback_data="intv:finish")],
@@ -861,6 +862,8 @@ def md_to_html(text: str) -> str:
     # Удаляем любые не-поддерживаемые теги, оставляя их содержимое
     html = re.sub(r'</?(?:table|thead|tbody|tr|td|th|div|span|font|img|figure)\b[^>]*>', '', html)
     html = html.replace('<tg-spoiler>', '<span class="tg-spoiler">').replace('</tg-spoiler>', '</span>')
+    # Убираем оставшиеся непарные бэктики (иначе Telegram ломает разметку и красит хвост в моноширинный)
+    html = html.replace('`', '')
     # Схлопываем избыточные переносы
     html = re.sub(r' *\n *', '\n', html)
     html = re.sub(r'\n{3,}', '\n\n', html)
