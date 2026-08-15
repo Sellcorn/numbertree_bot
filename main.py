@@ -269,6 +269,8 @@ INTERVIEW_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "inter
 DEFAULT_INTERVIEW = {"title": "Go · техсобеседование", "description": "", "categories": {}, "questions": []}
 INTERVIEW = DEFAULT_INTERVIEW
 INTERVIEW_SESSIONS = {}
+# Данные последнего завершения сессии интервью (для LLM-резюме): chat_id -> {"msg", "written", "score", "total"}
+INTERVIEW_LAST_FINISH = {}
 # Сопоставление полл_id -> {"chat_id", "correct", "category"} для интервью-теста (MC)
 INTERVIEW_QUIZ = {}
 
@@ -471,11 +473,47 @@ async def _interview_next(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 def _interview_finish(chat_id: int) -> str:
     sess = INTERVIEW_SESSIONS.get(chat_id)
     score, total = (sess.get("score", 0), sess.get("total", 0)) if sess else (0, 0)
+    written = (sess.get("written", []) if sess else []) or []
     INTERVIEW_SESSIONS.pop(chat_id, None)
     INTERVIEW_QUIZ.clear()
-    return (f"{emoji('microphone')} <b>Техсобеседование завершено!</b>\n\n"
-            f"📊 Счёт: <b>{score}/{total}</b>\n"
-            f"Начать заново — /interview")
+    msg = (f"{emoji('microphone')} <b>Техсобеседование завершено!</b>\n\n"
+           f"📊 Счёт: <b>{score}/{total}</b>\n"
+           f"Начать заново — /interview")
+    # Краткая сводка по письменным ответам (если они были) добавляется после, в async-версии
+    INTERVIEW_LAST_FINISH[chat_id] = {"msg": msg, "written": written, "score": score, "total": total}
+    return msg
+
+
+async def _interview_finish_full(chat_id: int) -> str:
+    """Завершает сессию и, если были письменные ответы, генерирует LLM-резюме
+    уровня знаний и что нужно подтянуть."""
+    data = INTERVIEW_LAST_FINISH.pop(chat_id, {}) or {}
+    written = data.get("written", []) or []
+    score, total = data.get("score", 0), data.get("total", 0)
+    if not written:
+        return data.get("msg", f"{emoji('microphone')} Техсобеседование завершено!")
+    try:
+        provider_key, model_id = get_current_model(chat_id)
+        items = "\n".join(f"- {w.get('q')} — {w.get('score')}/10" for w in written)
+        avg = round(sum((w.get('score') or 0) for w in written) / max(len(written), 1), 1)
+        prompt = (
+            "Ты — карьерный консультант и техлид по Go. Кандидат только что прошёл собеседование, "
+            "где письменно отвечал на вопросы. По оценкам вопросов сделай вывод об уровне знаний и "
+            "дай конкретный план: что подтянуть и что требуется, чтобы выйти на уровень middle. "
+            "Формат ответа:\n"
+            "Уровень: ...\nСильные стороны: ...\nЧто подтянуть: ...\nПлан до middle: ...\n\n"
+            f"Средний балл по письменным ответам: {avg}/10.\n"
+            f"Вопросы и баллы:\n{items}"
+        )
+        parts = []
+        async for token, _ in call_provider_api(provider_key, model_id, [{"role": "user", "content": prompt}], stream=True, temperature=0.5):
+            parts.append(token)
+        text = "".join(parts).strip() or "Не удалось составить резюме."
+        return (f"{emoji('brain')} <b>Резюме собеседования</b>\n\n"
+                f"📊 Счёт: <b>{score}/{total}</b> · Ср. балл письменных: <b>{avg}/10</b>\n\n"
+                f"{md_to_html(text)}")
+    except Exception as e:
+        return data.get("msg", f"{emoji('microphone')} Техсобеседование завершено!") + f"\n\n{emoji('warning')} Резюме не сформировано: {e}"
 
 
 async def _interview_poll_result(update: Update, iinfo: dict):
@@ -512,7 +550,7 @@ async def _is_interview_active(chat_id: int) -> bool:
 
 async def _interview_grade(chat_id: int, question: dict, answer: str) -> str:
     """Оценивает письменный ответ на открытый вопрос через LLM.
-    Возвращает готовый HTML-текст с оценкой и фидбеком."""
+    Записывает оценку (0-10) в сессию и возвращает HTML-текст с оценкой и фидбеком."""
     provider_key, model_id = get_current_model(chat_id)
     question_text = question.get("q", "")
     correct = question.get("answer") or question.get("explanation", "")
@@ -530,8 +568,30 @@ async def _interview_grade(chat_id: int, question: dict, answer: str) -> str:
     async for token, _ in call_provider_api(provider_key, model_id, [{"role": "user", "content": prompt}], stream=True, temperature=0.4):
         parts.append(token)
     text = "".join(parts).strip() or "Не удалось получить оценку."
-    return (f"{emoji('brain')} <b>Оценка вашего ответа</b>\n\n"
-            f"{md_to_html(text)}")
+
+    # Извлекаем оценку 0-10 из ответа модели и пишем в сессию
+    sess = INTERVIEW_SESSIONS.setdefault(chat_id, {"score": 0, "total": 0, "written": [], "last_idx": -1, "queue": [], "category": None})
+    score = _extract_grade(text)
+    sess.setdefault("written", []).append({"q": question_text, "score": score})
+    sess["total"] += 1
+    if score >= 7:
+        sess["score"] += 1
+
+    header = (f"{emoji('brain')} <b>Оценка вашего ответа</b>\n"
+              f"{emoji('spark')} Балл: <b>{score}/10</b> · Счёт сессии: <b>{sess['score']}/{sess['total']}</b>\n\n")
+    return header + md_to_html(text)
+
+
+def _extract_grade(text: str) -> int:
+    """Достаёт число из 'Оценка: X/10' (или 'X/10'), иначе возвращает None."""
+    import re
+    m = re.search(r"(\d{1,2})\s*/\s*10", text)
+    if m:
+        try:
+            return max(0, min(10, int(m.group(1))))
+        except (ValueError, TypeError):
+            return None
+    return None
 
 
 async def _handle_interview_text(update: Update) -> bool:
@@ -556,7 +616,8 @@ async def _handle_interview_text(update: Update) -> bool:
         await _interview_next(chat_id, None)
         return True
     if any(k in words for k in finish_kw):
-        msg = _interview_finish(chat_id)
+        _interview_finish(chat_id)
+        msg = await _interview_finish_full(chat_id)
         await _interview_reply_finish(update, msg, chat_id)
         return True
 
@@ -1368,7 +1429,8 @@ async def _interview_callback(update: Update):
     elif data == "intv:answer":
         await _interview_show_answer(chat_id)
     elif data in ("intv:finish", "intv:close"):
-        msg = _interview_finish(chat_id)
+        _interview_finish(chat_id)
+        msg = await _interview_finish_full(chat_id)
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
         await query.edit_message_text(msg, parse_mode=ParseMode.HTML,
                                       reply_markup=InlineKeyboardMarkup(
