@@ -1,71 +1,174 @@
 {
   "title": "Путь разработчика (стек и языки)",
-  "description": "Двигайтесь по уровням. Каждый уровень закрывает конкретный стек и языки. Задачи и викторины генерируются под языки уровня.",
-  "levels": [
-    {
-      "id": "junior",
-      "title": "Junior: основы",
-      "difficulty": "easy",
-      "stack": "Frontend: HTML/CSS · Backend: Python",
-      "languages": ["Python", "JavaScript", "SQL"],
-      "focus": "базовый синтаксис, типы, условия, циклы, функции",
-      "tasks": [
+  "description": "Соберите свой стек: выберите нужные языки программирования или готовый шаблон. Каждый язык — свой путь от нуля. Прогресс и настройки сохраняются.",
+  "languages": {
+    "go": {
+      "name": "Go",
+      "icon": "🐹",
+      "stack": "Backend: Go",
+      "levels": [
         {
-          "name": "FizzBuzz на Python",
-          "desc": "Вывести числа от 1 до N, где кратные 3 → Fizz, 5 → Buzz, 3 и 5 → FizzBuzz. Ограничения: N (1..100), O(n).",
-          "lang": "Python"
+          "id": "go-1",
+          "title": "Go · основы синтаксиса",
+          "difficulty": "easy",
+          "languages": ["Go"],
+          "focus": "установка, go.mod, переменные, типы, fmt, if/for/switch, функции, срезы, map",
+          "tasks": [
+            {"name": "FizzBuzz на Go", "lang": "Go", "desc": "Вывести числа 1..N, кратные 3 → Fizz, 5 → Buzz, 3 и 5 → FizzBuzz."},
+            {"name": "Среднее по срезу", "lang": "Go", "desc": "Функция avg([]int) → float64 среднее арифметическое, работа со срезами."}
+          ]
         },
         {
-          "name": "Реверс строки без reversed",
-          "desc": "Развернуть строку на JavaScript без встроенных методов. Пример: 'abc' → 'cba'.",
-          "lang": "JavaScript"
+          "id": "go-2",
+          "title": "Go · структуры и интерфейсы",
+          "difficulty": "easy",
+          "languages": ["Go"],
+          "focus": "struct, методы на value/pointer receivers, interfaces, error-обработка, embedding",
+          "tasks": [
+            {"name": "Shape interface", "lang": "Go", "desc": "Интерфейс Shape с Area()/Perimeter(), реализации Circle и Rectangle."},
+            {"name": "SafeCounter", "lang": "Go", "desc": "struct с мьютексом для безопасного конкурентного подсчёта."}
+          ]
         },
         {
-          "name": "Второй максимум SQL",
-          "desc": "Написать запрос, возвращающий второй по величине salary из таблицы employees без использования LIMIT/OFFSET.",
-          "lang": "SQL"
+          "id": "go-3",
+          "title": "Go · конкурентность",
+          "difficulty": "medium",
+          "languages": ["Go"],
+          "focus": "goroutines, channels, select, sync.WaitGroup, sync.Mutex, worker pool, race detector",
+          "tasks": [
+            {"name": "Worker pool", "lang": "Go", "desc": "Пул воркеров с каналами, ограничением конкурентности и graceful shutdown."},
+            {"name": "Fan-in/fan-out", "lang": "Go", "desc": "Параллельная обработка задач через каналы и select."}
+          ]
+        },
+        {
+          "id": "go-4",
+          "title": "Go · тесты и роутинг HTTP",
+          "difficulty": "medium",
+          "languages": ["Go"],
+          "focus": "testing, table-driven tests, http.Handler/mux, json, middleware, context",
+          "tasks": [
+            {"name": "REST API на net/http", "lang": "Go", "desc": "CRUD по /tasks с JSON и обработкой ошибок, без сторонних фреймворков."},
+            {"name": "Table-driven тесты", "lang": "Go", "desc": "Написать unit-тесты для функции с табличными случаями и покрытием edge cases."}
+          ]
+        },
+        {
+          "id": "go-5",
+          "title": "Go · мидл: микросервисы",
+          "difficulty": "hard",
+          "languages": ["Go"],
+          "focus": "clean architecture, dependency injection, gRPC или REST, БД, Docker, graceful shutdown",
+          "tasks": [
+            {"name": "Graceful shutdown", "lang": "Go", "desc": "Обработка SIGTERM, корректная остановка HTTP-сервера и пула воркеров."},
+            {"name": "Сервис с БД", "lang": "Go", "desc": "Микросервис с PostgreSQL, слоями (handler/service/repo) и тестами."}
+          ]
         }
       ]
     },
-    {
-      "id": "middle",
-      "title": "Middle: структуры данных",
-      "difficulty": "medium",
-      "stack": "Backend: Python/FastAPI · Frontend: React TS",
-      "languages": ["Python", "TypeScript"],
-      "focus": "структуры данных, сложность, ООП, REST, типизация",
-      "tasks": [
+    "python": {
+      "name": "Python",
+      "icon": "🐍",
+      "stack": "Backend: Python",
+      "levels": [
         {
-          "name": "Хеш-таблица вручную",
-          "desc": "Реализовать HashMap на Python с открытой адресацией (put/get/delete). Амортизированная сложность O(1).",
-          "lang": "Python"
+          "id": "py-1",
+          "title": "Python · основы",
+          "difficulty": "easy",
+          "languages": ["Python"],
+          "focus": "типы, списки, словари, f-строки, if/for/while, функции, разбор ошибок",
+          "tasks": [
+            {"name": "FizzBuzz на Python", "lang": "Python", "desc": "Вывести числа 1..N с подменой Fizz/Buzz/FizzBuzz."},
+            {"name": "Частотность слов", "lang": "Python", "desc": "Подсчитать частоту слов в тексте, вернуть топ-10."}
+          ]
         },
         {
-          "name": "Generic стека на TS",
-          "desc": "Написать TypeScript-класс Stack<T> с push/pop/peek/isEmpty и типизированными методами.",
-          "lang": "TypeScript"
+          "id": "py-2",
+          "title": "Python · структуры данных",
+          "difficulty": "medium",
+          "languages": ["Python"],
+          "focus": "ООП, компрехеншены, генераторы, декораторы, сложность, типизация (typing)",
+          "tasks": [
+            {"name": "Декоратор-кэш", "lang": "Python", "desc": "Реализовать lru-кэш декоратор."},
+            {"name": "Класс очереди", "lang": "Python", "desc": "Реализовать потокобезопасную очередь на deque."}
+          ]
+        },
+        {
+          "id": "py-3",
+          "title": "Python · мидл: веб и данные",
+          "difficulty": "hard",
+          "languages": ["Python"],
+          "focus": "FastAPI/Flask, async/await (asyncio), SQLAlchemy, Pydantic, REST, тесты pytest",
+          "tasks": [
+            {"name": "REST API FastAPI", "lang": "Python", "desc": "CRUD-сервис с Pydantic-схемами и валидацией."},
+            {"name": "Async-загрузчик", "lang": "Python", "desc": "Параллельная загрузка N URL через asyncio с лимитом конкурентности."}
+          ]
         }
       ]
     },
-    {
-      "id": "senior",
-      "title": "Senior: системы",
-      "difficulty": "hard",
-      "stack": "Backend: Go · Infra: Docker/K8s",
-      "languages": ["Go", "Golang", "Docker"],
-      "focus": "конкурентность, goroutines, системное проектирование, деплой",
-      "tasks": [
+    "typescript": {
+      "name": "TypeScript",
+      "icon": "🟦",
+      "stack": "Frontend: TS/JS",
+      "levels": [
         {
-          "name": "Worker pool на Go",
-          "desc": "Реализовать пул воркеров на Go с каналами, ограничением конкурентности и graceful shutdown.",
-          "lang": "Go"
+          "id": "ts-1",
+          "title": "TS · основы типизации",
+          "difficulty": "easy",
+          "languages": ["TypeScript"],
+          "focus": "типы, интерфейсы, union/intersection, generics базово, tsconfig",
+          "tasks": [
+            {"name": "Generic Stack", "lang": "TypeScript", "desc": "Класс Stack<T> с типизированными push/pop/peek."},
+            {"name": "Утилитарные типы", "lang": "TypeScript", "desc": "Построить Partial/Pick/Readonly-варианты интерфейса."}
+          ]
         },
         {
-          "name": "Graceful shutdown Docker",
-          "desc": "Описать Dockerfile и signal-handling в Go для корректного остановки контейнера (SIGTERM).",
-          "lang": "Go"
+          "id": "ts-2",
+          "title": "TS · мидл: React",
+          "difficulty": "medium",
+          "languages": ["TypeScript"],
+          "focus": "React hooks, props/state, работа с API, строгая типизация компонентов",
+          "tasks": [
+            {"name": "Типизированный хук", "lang": "TypeScript", "desc": "useFetch<T> с generic и состояниями загрузки."},
+            {"name": "Список с пагинацией", "lang": "TypeScript", "desc": "Компонент списка с типизированными props."}
+          ]
         }
       ]
+    }
+  },
+  "templates": [
+    {
+      "id": "go_zero_to_middle",
+      "name": "Go · от нуля до мидла",
+      "icon": "🐹",
+      "description": "Полный путь по Go: синтаксис → структуры/интерфейсы → конкурентность → тесты/HTTP → микросервисы.",
+      "languages": ["go"]
+    },
+    {
+      "id": "backend_python_go",
+      "name": "Backend · Python + Go",
+      "icon": "⚙️",
+      "description": "Два языка бэкенда: Python (веб/данные) и Go (конкурентность/микросервисы).",
+      "languages": ["python", "go"]
+    },
+    {
+      "id": "fullstack_ts_go",
+      "name": "Fullstack · TS + Go",
+      "icon": "🖥️",
+      "description": "Frontend на TypeScript/React и backend на Go.",
+      "languages": ["typescript", "go"]
+    },
+    {
+      "id": "python_only",
+      "name": "Python · основы → мидл",
+      "icon": "🐍",
+      "description": "Только Python: от синтаксиса до веб-сервисов.",
+      "languages": ["python"]
+    },
+    {
+      "id": "ts_frontend",
+      "name": "Frontend · TypeScript",
+      "icon": "🟦",
+      "description": "Только клиентская разработка на TypeScript/React.",
+      "languages": ["typescript"]
     }
   ]
 }

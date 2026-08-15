@@ -46,13 +46,19 @@ PROVIDERS = {
 USER_SETTINGS = {}
 DEFAULT_PROVIDER = "qwen"
 
-# ============ ROADMAP (конфигурация уровней) ============
-# Читается из roadmap.json рядом с ботом. Каждый уровень = стек, языки, темы для изучения.
+# ============ ROADMAP (конфигурация уровней и стека) ============
+# Читается из roadmap.json рядом с ботом. Содержит:
+#   - "languages": каталог языков, у каждого — свой путь (уровни от нуля)
+#   - "templates": готовые шаблоны стека (набор языков)
+# Пользователь выбирает шаблон или собирает свой стек из языков — это определяет
+# активный список уровней (active_levels). Настройки и прогресс хранятся в progress.json.
 ROADMAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "roadmap.json")
+PROGRESS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "progress.json")
 DEFAULT_ROADMAP = {
     "title": "Путь разработчика",
     "description": "Базовый конфиг. Отредактируйте roadmap.json.",
-    "levels": [],
+    "languages": {},
+    "templates": [],
 }
 ROADMAP = DEFAULT_ROADMAP
 
@@ -63,7 +69,7 @@ def load_roadmap():
     try:
         with open(ROADMAP_PATH, encoding="utf-8") as f:
             data = json.load(f)
-        if data and isinstance(data, dict) and isinstance(data.get("levels"), list):
+        if data and isinstance(data, dict) and isinstance(data.get("languages"), dict):
             ROADMAP = data
             return True
     except Exception as e:
@@ -73,30 +79,126 @@ def load_roadmap():
 
 load_roadmap()
 
-# Прогресс пользователя: chat_id -> {"level_index": int, "done_topics": set-ish list}
-# Текущий уровень и пройденные темы хранятся в памяти (по chat_id).
-ROADMAP_PROGRESS = {}
+# ============ НАСТРОЙКИ И ПРОГРЕСС ПОЛЬЗОВАТЕЛЯ (персистентно в progress.json) ============
+# Структура: chat_id(str) -> {
+#   "template": str|None          — id выбранного готового шаблона
+#   "languages": [lang_id, ...]   — языки своего стека (если без шаблона)
+#   "level_index": int            — текущий уровень в активном списке
+#   "done_topics": [str, ...]     — пройденные темы
+# }
+# В памяти под дублируется для скорости, persist в progress.json при изменениях.
+PROGRESS_LOCK = asyncio.Lock()
+USER_CONFIG = {}  # chat_id -> настройки стека (без скорости, хранится в файле)
+
+# Загружается при старте в USER_CONFIG
+def _load_user_config():
+    global USER_CONFIG
+    try:
+        with open(PROGRESS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            USER_CONFIG = data
+    except FileNotFoundError:
+        USER_CONFIG = {}
+    except Exception as e:
+        USER_CONFIG = {}
+        logger.error(f"Не удалось загрузить progress.json: {e}")
 
 
-def get_level(index: int) -> dict | None:
-    levels = ROADMAP.get("levels", [])
+def _load_user_config_sync():
+    _load_user_config()
+
+
+# Загружаем сохранённые настройки при старте (синхронно, до запуска loop)
+_load_user_config()
+
+
+async def _save_user_config():
+    """Сохраняет USER_CONFIG в progress.json (атомарно, под локом)."""
+    async with PROGRESS_LOCK:
+        tmp = PROGRESS_PATH + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(USER_CONFIG, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, PROGRESS_PATH)
+        except Exception as e:
+            logger.error(f"Не удалось сохранить progress.json: {e}")
+
+
+def _get_user_settings(chat_id: int) -> dict:
+    sid = str(chat_id)
+    if sid not in USER_CONFIG or not isinstance(USER_CONFIG[sid], dict):
+        USER_CONFIG[sid] = {"template": None, "languages": [], "level_index": 0, "done_topics": []}
+    s = USER_CONFIG[sid]
+    s.setdefault("template", None)
+    s.setdefault("languages", [])
+    s.setdefault("level_index", 0)
+    s.setdefault("done_topics", [])
+    return s
+
+
+def get_progress(chat_id: int) -> dict:
+    """Настройки+прогресс пользователя (персистентные)."""
+    return _get_user_settings(chat_id)
+
+
+# ============ АКТИВНЫЙ СПИСОК УРОВНЕЙ (исходя из выбранного шаблона/языков) ============
+def _lang_levels(lang_id: str) -> list:
+    return list(ROADMAP.get("languages", {}).get(lang_id, {}).get("levels", []))
+
+
+def _template_levels(tpl_id: str) -> list:
+    """Уровни готового шаблона = конкатенация уровней его языков (в порядке из шаблона)."""
+    tpl = None
+    for t in ROADMAP.get("templates", []):
+        if t.get("id") == tpl_id:
+            tpl = t
+            break
+    if not tpl:
+        return []
+    out = []
+    for lang_id in tpl.get("languages", []):
+        out.extend(_lang_levels(lang_id))
+    return out
+
+
+def active_levels(chat_id: int) -> list:
+    """Список уровней для пользователя: из выбранного шаблона, либо из его языков.
+    Если ничего не выбрано — все уровни всех языков каталога (демо-режим)."""
+    s = _get_user_settings(chat_id)
+    if s.get("template"):
+        lvl = _template_levels(s["template"])
+        if lvl:
+            return lvl
+    langs = s.get("languages") or []
+    out = []
+    for lang_id in langs:
+        out.extend(_lang_levels(lang_id))
+    if out:
+        return out
+    # demo: все языки
+    demo = []
+    for lang_id in ROADMAP.get("languages", {}):
+        demo.extend(_lang_levels(lang_id))
+    return demo
+
+
+def get_level(chat_id: int, index: int) -> dict | None:
+    levels = active_levels(chat_id)
     if 0 <= index < len(levels):
         return levels[index]
     return None
 
 
-def normalize_level_index(index: int) -> int:
-    levels = ROADMAP.get("levels", [])
+def normalize_level_index(chat_id: int, index: int) -> int:
+    levels = active_levels(chat_id)
     if not levels:
         return 0
     return max(0, min(index, len(levels) - 1))
 
 
-def get_progress(chat_id: int) -> dict:
-    """Прогресс пользователя: {level_index, done_topics:[...]}."""
-    if chat_id not in ROADMAP_PROGRESS:
-        ROADMAP_PROGRESS[chat_id] = {"level_index": 0, "done_topics": []}
-    return ROADMAP_PROGRESS[chat_id]
+def level_count(chat_id: int) -> int:
+    return len(active_levels(chat_id))
 
 
 def topics_of(level: dict) -> list[str]:
@@ -106,7 +208,7 @@ def topics_of(level: dict) -> list[str]:
 
 def level_topics_done(chat_id: int, level_index: int) -> list[str]:
     """Список пройденных тем пользователя для данного уровня."""
-    level = get_level(level_index)
+    level = get_level(chat_id, level_index)
     if not level:
         return []
     tops = topics_of(level)
@@ -114,6 +216,45 @@ def level_topics_done(chat_id: int, level_index: int) -> list[str]:
     key = f"lvl{level_index}"
     done_keys = set(prog.get("done_topics", []))
     return [t for t in tops if f"{key}#{tops.index(t)}" in done_keys]
+
+
+async def set_user_template(chat_id: int, tpl_id: str):
+    """Выбирает готовый шаблон стека, сбрасывая свой набор языков."""
+    s = _get_user_settings(chat_id)
+    s["template"] = tpl_id
+    s["languages"] = []
+    s["level_index"] = 0
+    s["done_topics"] = []
+    await _save_user_config()
+
+
+async def toggle_user_language(chat_id: int, lang_id: str, on: bool):
+    """Включает/выключает язык в пользовательском стеке."""
+    s = _get_user_settings(chat_id)
+    s["languages"] = [l for l in s["languages"] if l != lang_id]
+    if on:
+        s["languages"].append(lang_id)
+        s["template"] = None
+    if not s["languages"]:
+        s["template"] = None
+    s["level_index"] = 0
+    s["done_topics"] = []
+    await _save_user_config()
+
+
+async def reset_user_stack(chat_id: int):
+    s = _get_user_settings(chat_id)
+    s["template"] = None
+    s["languages"] = []
+    s["level_index"] = 0
+    s["done_topics"] = []
+    await _save_user_config()
+
+
+async def set_level_index(chat_id: int, index: int):
+    s = _get_user_settings(chat_id)
+    s["level_index"] = max(0, min(index, level_count(chat_id) - 1))
+    await _save_user_config()
 
 
 # Времчивое хранилище сгенерированных задач/викторин для экспорта:
@@ -139,7 +280,7 @@ def build_export_markdown(chat_id: int) -> str:
     lines.append(f"{ROADMAP.get('description', '')}\n")
     prog = get_progress(chat_id)
 
-    for idx, level in enumerate(ROADMAP.get("levels", [])):
+    for idx, level in enumerate(active_levels(chat_id)):
         title = level.get("title", f"Уровень {idx + 1}")
         lines.append(f"## {idx + 1}. {title}\n")
         lines.append(f"- **Уровень**: {level.get('difficulty', 'medium')}")
@@ -236,6 +377,7 @@ def emoji(key: str) -> str:
         "code": "💻",
         "warning": "⚠️",
         "error": "❌",
+        "target": "🎯",
     }
     custom_id = CUSTOM_EMOJI.get(key)
     if custom_id:
@@ -389,6 +531,7 @@ def build_main_menu(chat_id: int):
         InlineKeyboardButton("🎯 Задачи по коду", callback_data="code_tasks"),
     ])
     buttons.append([InlineKeyboardButton("🗺️ Roadmap по уровням", callback_data="roadmap_menu")])
+    buttons.append([InlineKeyboardButton("🧰 Стек и языки (/stack)", callback_data="stack_menu")])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -463,7 +606,7 @@ def build_code_tasks_menu(chat_id: int):
 def build_roadmap_menu(chat_id: int):
     """Меню уровней (roadmap): текущий уровень и продвижение по стеку/языкам."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    levels = ROADMAP.get("levels", [])
+    levels = active_levels(chat_id)
     prog = get_progress(chat_id)
     buttons = []
     cur = prog.get("level_index", 0)
@@ -479,11 +622,48 @@ def build_roadmap_menu(chat_id: int):
     return InlineKeyboardMarkup(buttons)
 
 
+def build_stack_menu(chat_id: int):
+    """Меню выбора стека: готовый шаблон или свой набор языков."""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    s = _get_user_settings(chat_id)
+    cur_template = s.get("template")
+    cur_langs = set(s.get("languages", []))
+
+    lines = []
+    lines.append(f"{emoji('rocket')} <b>Стек и языки</b>\n")
+    if cur_template:
+        for t in ROADMAP.get("templates", []):
+            if t.get("id") == cur_template:
+                lines.append(f"{emoji('check')} Шаблон: <b>{t.get('icon', '')} {t.get('name', cur_template)}</b>")
+                break
+    elif cur_langs:
+        names = [ROADMAP["languages"][l].get("name", l) for l in cur_langs if l in ROADMAP.get("languages", {})]
+        lines.append(f"{emoji('check')} Свой стек: <b>{', '.join(names) or '—'}</b>")
+    else:
+        lines.append(f"{emoji('gear')} Пока выбран демо-режим (все языки).")
+    lines.append(f"{emoji('target')} Уровней в активном пути: <b>{level_count(chat_id)}</b>\n")
+
+    buttons = []
+    buttons.append([InlineKeyboardButton("🎲 Готовый шаблон:", callback_data="stack:none")])
+    for t in ROADMAP.get("templates", []):
+        mark = "✅ " if t.get("id") == cur_template else ""
+        buttons.append([InlineKeyboardButton(f"{mark}{t.get('icon', '')} {t.get('name')}", callback_data=f"stack:template:{t.get('id')}")])
+    buttons.append([InlineKeyboardButton("⚙️ Собрать свой стек:", callback_data="stack:none")])
+    for lang_id, lang in ROADMAP.get("languages", {}).items():
+        mark = "✅ " if lang_id in cur_langs else "  "
+        buttons.append([InlineKeyboardButton(f"{mark}{lang.get('icon', '')} {lang.get('name')}", callback_data=f"stack:lang:{lang_id}")])
+    buttons.append([InlineKeyboardButton("🗑️ Сбросить стек", callback_data="stack:reset")])
+    buttons.append([InlineKeyboardButton("🗺️ Перейти к уровням", callback_data="roadmap_menu")])
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")])
+    text = "\n".join(lines)
+    return text, InlineKeyboardMarkup(buttons)
+
+
 def build_roadmap_level_menu(chat_id: int, index: int):
     """Меню конкретного уровня: задача, викторина, темы, продвижение вперёд."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    index = normalize_level_index(index)
-    level = get_level(index)
+    index = normalize_level_index(chat_id, index)
+    level = get_level(chat_id, index)
     if not level:
         return build_roadmap_menu(chat_id)
     tops = topics_of(level)
@@ -504,7 +684,7 @@ def build_roadmap_level_menu(chat_id: int, index: int):
     buttons.append([InlineKeyboardButton(f"📤 Экспорт уровня (.md)", callback_data=f"road:export:{index}")])
     # следующ. уровень
     next_index = index + 1
-    if next_index < len(ROADMAP.get("levels", [])):
+    if next_index < level_count(chat_id):
         buttons.append([InlineKeyboardButton("➡️ Следующий уровень", callback_data=f"road:next:{index}")])
     else:
         buttons.append([InlineKeyboardButton("🏁 Дошёл до конца", callback_data="road:finish")])
@@ -514,8 +694,8 @@ def build_roadmap_level_menu(chat_id: int, index: int):
 
 def build_roadmap_level_text(chat_id: int, index: int) -> str:
     """Текст описания уровня с прогрессом по темам."""
-    index = normalize_level_index(index)
-    level = get_level(index)
+    index = normalize_level_index(chat_id, index)
+    level = get_level(chat_id, index)
     if not level:
         return f"{emoji('warning')} Уровень не найден."
     tops = topics_of(level)
@@ -533,8 +713,8 @@ def build_roadmap_level_text(chat_id: int, index: int) -> str:
             mark = "✅" if t in done_keys else "⬜"
             lines.append(f"{mark} {t}")
     next_index = index + 1
-    if next_index < len(ROADMAP.get("levels", [])):
-        lines.append(f"\nСледующий: <b>{ROADMAP['levels'][next_index].get('title', '')}</b>")
+    if next_index < level_count(chat_id):
+        lines.append(f"\nСледующий: <b>{get_level(chat_id, next_index).get('title', '')}</b>")
     else:
         lines.append("\n🏁 Это последний уровень.")
     return "\n".join(lines)
@@ -805,16 +985,44 @@ async def roadmap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def stack_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню выбора стека и языков: /stack"""
+    chat_id = update.message.chat_id
+    text, markup = build_stack_menu(chat_id)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
+async def stack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопок меню /stack: шаблон, язык, сброс."""
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    data = query.data
+    payload = data.removeprefix("stack:")
+    if payload == "reset":
+        await reset_user_stack(chat_id)
+    elif payload.startswith("template:"):
+        await set_user_template(chat_id, payload.split(":", 1)[1])
+    elif payload.startswith("lang:"):
+        lang_id = payload.split(":", 1)[1]
+        cur = set(_get_user_settings(chat_id).get("languages", []))
+        await toggle_user_language(chat_id, lang_id, lang_id not in cur)
+    elif payload == "none":
+        pass
+    text, markup = build_stack_menu(chat_id)
+    await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
 async def learn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Режим обучения по уровню roadmap: /learn [index]"""
     index = 0
+    chat_id = update.message.chat_id
     if context.args:
         try:
             index = int(context.args[0]) - 1
         except ValueError:
             index = 0
-    index = normalize_level_index(index)
-    chat_id = update.message.chat_id
+    index = normalize_level_index(chat_id, index)
     await update.message.reply_text(
         building_learn_start(chat_id, index),
         parse_mode=ParseMode.HTML
@@ -823,7 +1031,7 @@ async def learn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def building_learn_start(chat_id: int, index: int) -> str:
     """Промежуточное сообщение перед запуском обучения."""
-    level = get_level(index)
+    level = get_level(chat_id, index)
     if not level:
         return f"{emoji('warning')} Уровень не найден."
     return (f"{emoji('spark')} Начинаю обучение по уровню <b>{level.get('title', 'Уровень')}</b>.\n"
@@ -854,7 +1062,7 @@ def txt_fname(fname: str) -> str:
 
 def build_export_with_level(chat_id: int, index: int) -> str:
     """Экспорт одного уровня в markdown."""
-    level = get_level(index)
+    level = get_level(chat_id, index)
     if not level:
         return ""
     lines = []
@@ -910,8 +1118,8 @@ async def roadmap_export_all(chat_id: int):
 
 def mark_topic_done(chat_id: int, index: int) -> tuple[str, int]:
     """Отмечает следующую неотмеченную тему уровня. Возвращает (задача, прогресс)."""
-    index = normalize_level_index(index)
-    level = get_level(index)
+    index = normalize_level_index(chat_id, index)
+    level = get_level(chat_id, index)
     if not level:
         return "Уровень не найден", 0
     tops = topics_of(level)
@@ -929,8 +1137,8 @@ def mark_topic_done(chat_id: int, index: int) -> tuple[str, int]:
 async def _run_learn(chat_id: int, context: ContextTypes.DEFAULT_TYPE, index: int):
     """Режим обучения: отправляет теорию по уровню roadmap, затем тест (викторину),
     и по ответу на полл оценивает знание."""
-    index = normalize_level_index(index)
-    level = get_level(index)
+    index = normalize_level_index(chat_id, index)
+    level = get_level(chat_id, index)
     if not level:
         from telegram import Bot
         bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
@@ -1348,7 +1556,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     
     # Быстрые переходы меню — отвечаем сразу
-    if data in ("main_menu", "models_menu", "quiz_menu", "poll_menu", "code_help", "code_tasks", "roadmap_menu"):
+    if data in ("main_menu", "models_menu", "quiz_menu", "poll_menu", "code_help", "code_tasks", "roadmap_menu", "stack_menu"):
         await query.answer()
     
     if data == "main_menu":
@@ -1425,6 +1633,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
             reply_markup=build_roadmap_menu(chat_id)
         )
+    elif data == "stack_menu":
+        await query.answer()
+        text, markup = build_stack_menu(chat_id)
+        await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    elif data.startswith("stack:"):
+        await stack_callback(update, context)
+        return
     elif data == "road:menu":
         await query.answer()
         await query.edit_message_text(
@@ -1446,8 +1661,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif data.startswith("road:"):
         _, action, raw_index = data.split(":", 2)
-        index = normalize_level_index(int(raw_index))
-        level = get_level(index)
+        index = normalize_level_index(chat_id, int(raw_index))
+        level = get_level(chat_id, index)
         if action == "level":
             await query.answer()
             await query.edit_message_text(
@@ -1467,11 +1682,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif action == "quiz" and level:
             await query.answer("🧠 Генерирую викторину по языку...")
             await _run_quiz(chat_id, context, "programming", level)
-        elif action == "export":
-            await query.answer(f"{emoji('check')} Экспортирую уровень {index + 1}...")
-            await roadmap_export_level(chat_id, index)
         elif action == "done":
             msg, ndone = mark_topic_done(chat_id, index)
+            await _save_user_config()
             await query.answer(f"{emoji('check')} {msg}")
             await query.edit_message_text(
                 build_roadmap_level_text(chat_id, index),
@@ -1479,9 +1692,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=build_roadmap_level_menu(chat_id, index)
             )
         elif action == "next":
-            prog = get_progress(chat_id)
-            prog["level_index"] = index + 1
-            nxt = normalize_level_index(index + 1)
+            nxt = normalize_level_index(chat_id, index + 1)
+            await set_level_index(chat_id, nxt)
             await query.answer(f"Переходим к уровню {nxt + 1}")
             await query.edit_message_text(
                 build_roadmap_level_text(chat_id, nxt),
@@ -1683,6 +1895,7 @@ def main():
             BotCommand("clear", "🗑 Очистить историю диалога"),
             BotCommand("start", "🚀 Перезапуск бота"),
             BotCommand("roadmap", "🗺️ Roadmap по уровням (стек/языки)"),
+            BotCommand("stack", "🧰 Выбрать стек и языки"),
             BotCommand("learn", "🎓 Режим обучения: теория + тест"),
             BotCommand("export", "📤 Экспорт tasks/вопросов в .md для Obsidian"),
         ])
@@ -1700,6 +1913,7 @@ def main():
     app.add_handler(CommandHandler("code", lambda u, c: code_help_handler(u, c, c.args[0] if c.args else "explain")))
     app.add_handler(CommandHandler("task", lambda u, c: task_handler(u, c, c.args[0] if c.args else "medium")))
     app.add_handler(CommandHandler("roadmap", roadmap_command))
+    app.add_handler(CommandHandler("stack", stack_command))
     app.add_handler(CommandHandler("learn", learn_command))
     app.add_handler(CommandHandler("export", export_command))
     app.add_handler(CallbackQueryHandler(callback_handler))
