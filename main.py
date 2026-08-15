@@ -243,15 +243,60 @@ def emoji(key: str) -> str:
     return fallback[key]
 
 
+# HTML-теги, которые поддерживает Telegram (см. Bot API, раздел «HTML style»).
+# НЕ поддерживает: table, th, td, tr, ul, ol, li, h1-h6, hr, div, span (кроме tg-spoiler).
+_TG_TAGS = ("b", "strong", "i", "em", "u", "ins", "s", "strike", "del",
+            "a", "code", "pre", "blockquote", "tg-spoiler", "tg-emoji", "br")
+
+
+_TABLE_ROW_RE = re.compile(r'^\s*\|?(?:\s*[^|]+\s*\|\s*)+\s*\|?\s*$')
+_TABLE_SEP_RE = re.compile(r'^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$')
+
+
+def _convert_table_blocks(text: str) -> str:
+    """Находит markdown-таблицы и превращает их в Telegram-совместимый
+    monospace-блок <pre> (Telegram не поддерживает <table>, <th>, <td>)."""
+    lines = text.split("\n")
+    out = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        # Таблица начинается с строки, содержащей '|', за которой идёт разделитель
+        if "|" in line and i + 1 < n and _TABLE_SEP_RE.match(lines[i + 1]):
+            block = [line, lines[i + 1]]
+            j = i + 2
+            while j < n and "|" in lines[j] and _TABLE_ROW_RE.match(lines[j]):
+                block.append(lines[j])
+                j += 1
+            rows = []
+            for bl in block:
+                if _TABLE_SEP_RE.match(bl):
+                    continue
+                cells = [c.strip() for c in bl.strip().strip("|").split("|")]
+                rows.append("| " + " | ".join(cells) + " |")
+            if rows:
+                out.append("\n".join(["<pre>"] + rows + ["</pre>"]))
+            i = j
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
+
+
 def md_to_html(text: str) -> str:
-    """Конвертирует markdown в HTML для Telegram. Агрессивно удаляет HTML."""
+    """Конвертирует markdown в HTML для Telegram. Гарантирует, что на выходе
+    только теги, поддерживаемые Telegram (заголовки→жирный текст, таблицы→<pre>)."""
     if not text:
         return ""
     # СНАЧАЛА удаляем ВСЕ HTML-теги (модели часто выдают HTML вместо markdown)
     text = re.sub(r'<[^>]+>', '', text)
-    # Конвертируем markdown-заголовки в жирный текст (Telegram не поддерживает h1-h6)
+    # Markdown-таблицы --> в <pre> (Telegram не умеет <table>)
+    text = _convert_table_blocks(text)
+    # Заголовки --> жирный текст (h1-h6 не поддерживаются)
     text = re.sub(r'(?m)^(#{1,6})\s+(.+)$', lambda m: f"<b>{m.group(2)}</b>", text)
-    # Затем конвертируем остальной markdown в HTML
+    # HR --> разделитель
+    text = re.sub(r'(?m)^\s*(---+|\*\*\*+)\s*$', '────────────────', text)
     md = markdown.Markdown(
         extensions=["fenced_code", "tables", "nl2br", "sane_lists"],
         output_format="html",
@@ -259,11 +304,23 @@ def md_to_html(text: str) -> str:
     html = md.convert(text)
     html = re.sub(r'<pre><code class="language-(\w+)">', r'<pre><code>', html)
     html = html.replace('<code class="language-">', '<code>')
-    # Заголовки могут всё ещё прийти из markdown-расширений — делаем их жирным текстом
+    html = re.sub(r'<p>', '', html)
+    html = html.replace('</p>', '\n')
+    # ul/ol/li --> списки простым текстом (Telegram не поддерживает эти теги)
+    html = re.sub(r'<ul>|<ol>', '\n', html)
+    html = re.sub(r'</ul>|</ol>', '\n', html)
+    html = re.sub(r'<li>', '• ', html)
+    html = re.sub(r'</li>', '\n', html)
+    # Остальные теги --> в допустимый вид
     html = re.sub(r'<h[1-6][^>]*>', '<b>', html)
     html = re.sub(r'</h[1-6]>', '</b>', html)
-    html = html.replace('<p>', '').replace('</p>', '\n')
+    html = re.sub(r'<hr[^>]*>', '\n────────────────\n', html)
     html = html.replace('<br />', '\n').replace('<br>', '\n')
+    # Удаляем любые не-поддерживаемые теги, оставляя их содержимое
+    html = re.sub(r'</?(?:table|thead|tbody|tr|td|th|div|span|font|img|figure)\b[^>]*>', '', html)
+    html = html.replace('<tg-spoiler>', '<span class="tg-spoiler">').replace('</tg-spoiler>', '</span>')
+    # Схлопываем избыточные переносы
+    html = re.sub(r' *\n *', '\n', html)
     html = re.sub(r'\n{3,}', '\n\n', html)
     return html.strip()
 
