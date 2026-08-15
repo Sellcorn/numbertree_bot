@@ -505,9 +505,33 @@ async def _interview_poll_result(update: Update, iinfo: dict):
     )
 
 
-def _is_interview_active(chat_id: int) -> bool:
+async def _is_interview_active(chat_id: int) -> bool:
     """True, если для чата уже запущена сессия техсобеседования."""
     return chat_id in INTERVIEW_SESSIONS
+
+
+async def _interview_grade(chat_id: int, question: dict, answer: str) -> str:
+    """Оценивает письменный ответ на открытый вопрос через LLM.
+    Возвращает готовый HTML-текст с оценкой и фидбеком."""
+    provider_key, model_id = get_current_model(chat_id)
+    question_text = question.get("q", "")
+    correct = question.get("answer") or question.get("explanation", "")
+    prompt = (
+        "Ты — строгий интервьюер на техническом собеседовании (Go-разработчик). "
+        "Оцени письменный ответ кандидата на вопрос. "
+        "Оцени по шкале 0-10 и дай короткий разбор: что ответил верно, что упустил, "
+        "как стоило бы ответить. Формат ответа:\n\n"
+        "Оценка: X/10\nВерно: ...\nУпущено: ...\nМожно добавить: ...\n\n"
+        f"Вопрос: {question_text}\n"
+        f"Правильный/эталонный ответ (для справки): {correct}\n"
+        f"Ответ кандидата: {answer}"
+    )
+    parts = []
+    async for token, _ in call_provider_api(provider_key, model_id, [{"role": "user", "content": prompt}], stream=True, temperature=0.4):
+        parts.append(token)
+    text = "".join(parts).strip() or "Не удалось получить оценку."
+    return (f"{emoji('brain')} <b>Оценка вашего ответа</b>\n\n"
+            f"{md_to_html(text)}")
 
 
 async def _handle_interview_text(update: Update) -> bool:
@@ -535,6 +559,29 @@ async def _handle_interview_text(update: Update) -> bool:
         msg = _interview_finish(chat_id)
         await _interview_reply_finish(update, msg, chat_id)
         return True
+
+    # Остальное: считаем реплику письменным ответом и оцениваем через LLM
+    sess = INTERVIEW_SESSIONS.get(chat_id)
+    if sess:
+        qs = _interview_indexed()
+        idx = sess.get("last_idx", -1)
+        if 0 <= idx < len(qs):
+            q = qs[idx]
+            await update.message.reply_text(f"{emoji('thinking')} <b>Оцениваю ваш ответ...</b>", parse_mode=ParseMode.HTML)
+            try:
+                grade_text = await _interview_grade(chat_id, q, update.message.text)
+                from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+                nav = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⏭️ Следующий вопрос", callback_data="intv:next")],
+                    [InlineKeyboardButton("👁️ Показать разбор", callback_data="intv:answer")],
+                    [InlineKeyboardButton("🏁 Завершить", callback_data="intv:finish")],
+                ])
+                await update.effective_chat.send_message(grade_text, parse_mode=ParseMode.HTML, reply_markup=nav)
+            except Exception as e:
+                await update.effective_chat.send_message(
+                    f"{emoji('error')} Не удалось оценить ответ: {e}",
+                    parse_mode=ParseMode.HTML)
+            return True
     return False
 
 
