@@ -505,6 +505,51 @@ async def _interview_poll_result(update: Update, iinfo: dict):
     )
 
 
+def _is_interview_active(chat_id: int) -> bool:
+    """True, если для чата уже запущена сессия техсобеседования."""
+    return chat_id in INTERVIEW_SESSIONS
+
+
+async def _handle_interview_text(update: Update) -> bool:
+    """Перехватывает текстовые реплики во время интервью.
+    Поддерживает: «объясни/разбор/покажи ответ», «дальше/следующий/следующий вопрос»,
+    «конец/закончить/завершить/стоп». В остальном игнорирует поле (не поедает обычный чат).
+    """
+    text = (update.message.text or "").strip().lower()
+    chat_id = update.effective_chat.id
+    if not text:
+        return False
+
+    words = text.replace("!", " ").replace("?", " ").strip()
+    explain_kw = ("объясни", "разбор", "покажи ответ", "правильный ответ", "объяснение", "почему", "ответ", "открой")
+    next_kw = ("дальше", "следующий", "след", "вперёд", "следующий вопрос", "след вопрос", "дал")
+    finish_kw = ("завершить", "закончить", "завершаем", "конец", "стоп", "завершить собеседование", "закрыть")
+
+    if any(k in words for k in explain_kw):
+        await _interview_show_answer(chat_id)
+        return True
+    if any(k in words for k in next_kw):
+        await _interview_next(chat_id, None)
+        return True
+    if any(k in words for k in finish_kw):
+        msg = _interview_finish(chat_id)
+        await _interview_reply_finish(update, msg, chat_id)
+        return True
+    return False
+
+
+async def _interview_reply_finish(update: Update, msg: str, chat_id: int):
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    chat = update.effective_chat
+    if chat and chat.type in ("group", "supergroup"):
+        await update.effective_chat.send_message(msg, parse_mode=ParseMode.HTML)
+    else:
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML,
+                                        reply_markup=InlineKeyboardMarkup(
+                                            [[InlineKeyboardButton("🎙️ Начать заново", callback_data="intv:start:")],
+                                             [InlineKeyboardButton("⬅️ Главное меню", callback_data="main_menu")]]))
+
+
 def add_generated_task(chat_id: int, level_title: str, item: dict):
     ROADMAP_GENERATED.setdefault(chat_id, {"tasks": [], "quizzes": []})
     ROADMAP_GENERATED[chat_id]["tasks"].append({"level": level_title, "item": item})
@@ -2017,6 +2062,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not should_respond(update):
         return
+
+    # Пока идёт техсобеседование — интерпретируем реплики как команды интервью
+    if (update.effective_chat and _is_interview_active(update.effective_chat.id)
+            and update.message and update.message.text):
+        consumed = await _handle_interview_text(update)
+        if consumed:
+            return
 
     # Логируем custom_emoji_id если есть (для получения ID из GameEmoji)
     if update.message.entities:
