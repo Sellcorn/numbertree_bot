@@ -1234,6 +1234,52 @@ async def call_provider_api(provider_key: str, model_id: str, messages: list[dic
 
 
 
+TELEGRAM_LIMIT = 4096
+SAFE_CHUNK = 3000  # запас: md_to_html добавляет теги, а <pre> для таблиц — особенно много
+
+
+def split_markdown(text: str, limit: int = SAFE_CHUNK) -> list[str]:
+    """Режет markdown на куски по границам абзацев, затем строк.
+
+    Режем ДО конвертации в HTML: если резать готовый HTML, теги рвутся посередине
+    и Telegram отвергает сообщение целиком.
+    """
+    text = text.strip()
+    if len(text) <= limit:
+        return [text] if text else []
+
+    chunks, current = [], ""
+
+    def flush():
+        nonlocal current
+        if current.strip():
+            chunks.append(current.strip())
+        current = ""
+
+    for para in text.split("\n\n"):
+        candidate = f"{current}\n\n{para}" if current else para
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        flush()
+        if len(para) <= limit:
+            current = para
+            continue
+        # Абзац сам длиннее лимита — разбираем по строкам, в крайнем случае режем жёстко
+        for line in para.split("\n"):
+            candidate = f"{current}\n{line}" if current else line
+            if len(candidate) <= limit:
+                current = candidate
+                continue
+            flush()
+            while len(line) > limit:
+                chunks.append(line[:limit])
+                line = line[limit:]
+            current = line
+    flush()
+    return chunks
+
+
 async def call_provider_api_once(provider_key: str, model_id: str, messages: list[dict],
                                  tools: list[dict] | None = None,
                                  temperature: float = 0.3) -> dict:
@@ -2373,9 +2419,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "1. Сверь факты между источниками. Если они расходятся — прямо скажи, "
                     "в чём именно и кому верить.\n"
                     "2. Больше доверяй официальным источникам (документация, релиз-ноуты, "
-                    "сайт проекта), меньше — блогам, агрегаторам, соцсетям и видео.\n"
-                    "3. Отвечай СЖАТО: только суть, без воды и без пересказа источников "
-                    "целиком. Уложись примерно в 250 слов.\n"
+                    "сайт проекта), меньше — блогам, агрегаторам, соцсетям и видео. "
+                    "Ссылайся на источники по имени сайта (например, go.dev или блог "
+                    "JetBrains), а НЕ номерами в квадратных скобках: нумерованного "
+                    "списка пользователь не увидит.\n"
+                    "3. Отвечай ПОДРОБНО и СТРУКТУРИРОВАННО: разбей на разделы с "
+                    "заголовками, используй списки и таблицы, разбери каждый существенный "
+                    "пункт из найденного, приводи конкретику — версии, даты, названия, "
+                    "примеры кода. Объём не ограничен, но воды быть не должно: "
+                    "каждый абзац несёт факт.\n"
                     "4. Последней строкой добавь ровно в таком виде: "
                     "«Достоверность: высокая/средняя/низкая — одно предложение почему». "
                     "Высокая — подтверждено официальным источником или несколькими "
@@ -2487,18 +2539,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         more = "" if len(by_domain) <= len(shown) else f" и ещё {len(by_domain) - len(shown)}"
         sources_block = f"\n\n<i>Источники: {links}{more}</i>"
 
-    # Красивый финальный ответ с мозгом 🧠
-    final_text = (
-        f"{emoji('brain')} <b>Ответ</b> <i>({elapsed}с)</i>\n\n"
-        f"{md_to_html(full_text)}"
-        f"{sources_block}"
-        f"{token_info}"
-    )
+    # Финальный ответ. Длинный текст режем на несколько сообщений: у Telegram
+    # лимит 4096 символов, и при превышении он отвергает сообщение целиком.
+    # Размер куска подбираем по факту: md_to_html раздувает текст тегами
+    # неравномерно (жирный текст — сильнее всего), и фиксированный лимит
+    # на насыщенной разметке всё равно вылезал бы за 4096.
+    reserve = TELEGRAM_LIMIT - 500  # запас на заголовок, источники и счётчик токенов
+    limit = SAFE_CHUNK
+    while True:
+        chunks = split_markdown(full_text, limit) or [""]
+        if limit <= 800 or all(len(md_to_html(c)) <= reserve for c in chunks):
+            break
+        limit = int(limit * 0.75)
 
-    try:
-        await thinking_msg.edit_text(final_text, parse_mode=ParseMode.HTML)
-    except Exception:
-        await thinking_msg.edit_text(final_text)
+    header = f"{emoji('brain')} <b>Ответ</b> <i>({elapsed}с)</i>\n\n"
+    footer = f"{sources_block}{token_info}"
+
+    async def deliver(text: str, first: bool):
+        """Отправляет часть ответа; при сбое HTML повторяет обычным текстом."""
+        try:
+            if first:
+                await thinking_msg.edit_text(text, parse_mode=ParseMode.HTML,
+                                             disable_web_page_preview=True)
+            else:
+                await update.message.reply_text(text, parse_mode=ParseMode.HTML,
+                                                disable_web_page_preview=True)
+            return
+        except Exception as e:
+            logger.warning(f"Часть ответа не ушла как HTML ({e}), повторяю текстом")
+
+        plain = re.sub(r"<[^>]+>", "", text)[:TELEGRAM_LIMIT]
+        try:
+            if first:
+                await thinking_msg.edit_text(plain)
+            else:
+                await update.message.reply_text(plain)
+        except Exception as e:
+            logger.error(f"Часть ответа не доставлена: {e}")
+
+    for i, chunk in enumerate(chunks):
+        body = md_to_html(chunk)
+        if i == 0:
+            body = header + body
+        if i == len(chunks) - 1:
+            body += footer
+        await deliver(body, first=(i == 0))
+
+
 
 
 def main():

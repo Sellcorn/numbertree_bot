@@ -27,11 +27,11 @@ logger = logging.getLogger(__name__)
 
 TAVILY_URL = "https://api.tavily.com/search"
 
-MAX_ROUNDS = 3               # кругов «подумал → поискал»
-MAX_QUERIES = 4              # формулировок за один вызов инструмента
-MAX_RESULTS = 5              # источников на одну формулировку
+MAX_ROUNDS = 6               # кругов «подумал → поискал»
+MAX_QUERIES = 5              # формулировок за один вызов инструмента
+MAX_RESULTS = 6              # источников на одну формулировку
 MAX_CHARS_PER_SOURCE = 1500  # обрезка выжимки одного источника
-MAX_CHARS_TOTAL = 8000       # потолок текста поиска на один круг
+MAX_CHARS_TOTAL = 14000      # потолок текста поиска на один круг
 SEARCH_TIMEOUT = 30.0
 
 TOOLS = [
