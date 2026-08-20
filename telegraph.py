@@ -19,6 +19,8 @@ import re
 
 import httpx
 
+import tables
+
 logger = logging.getLogger(__name__)
 
 API = "https://api.telegra.ph"
@@ -105,7 +107,9 @@ def markdown_to_nodes(md: str) -> list:
             while i < len(lines) and lines[i].strip().startswith("|"):
                 buf.append(lines[i].strip())
                 i += 1
-            nodes.append({"tag": "pre", "children": ["\n".join(buf)]})
+            rendered = tables.render_markdown_table(buf, tables.TELEGRAPH_WIDTH)
+            if rendered:
+                nodes.append({"tag": "pre", "children": [rendered]})
             continue
 
         if not stripped:

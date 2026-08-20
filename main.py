@@ -11,6 +11,7 @@ import httpx
 import markdown
 
 import research
+import tables
 import telegraph
 from dotenv import load_dotenv
 from telegram import Update
@@ -860,14 +861,9 @@ def _convert_table_blocks(text: str) -> str:
             while j < n and "|" in lines[j] and _TABLE_ROW_RE.match(lines[j]):
                 block.append(lines[j])
                 j += 1
-            rows = []
-            for bl in block:
-                if _TABLE_SEP_RE.match(bl):
-                    continue
-                cells = [c.strip() for c in bl.strip().strip("|").split("|")]
-                rows.append("| " + " | ".join(cells) + " |")
-            if rows:
-                out.append("\n".join(["<pre>"] + rows + ["</pre>"]))
+            rendered = tables.render_markdown_table(block, tables.TELEGRAM_WIDTH)
+            if rendered:
+                out.append("<pre>\n" + rendered + "\n</pre>")
             i = j
             continue
         out.append(line)
@@ -880,10 +876,22 @@ def md_to_html(text: str) -> str:
     только теги, поддерживаемые Telegram (заголовки→жирный текст, таблицы→<pre>)."""
     if not text:
         return ""
+    # <br> модели ставят внутри ячеек таблиц — без этого слова склеятся
+    text = re.sub(r'<br\s*/?>', ' ', text, flags=re.I)
     # СНАЧАЛА удаляем ВСЕ HTML-теги (модели часто выдают HTML вместо markdown)
     text = re.sub(r'<[^>]+>', '', text)
     # Markdown-таблицы --> в <pre> (Telegram не умеет <table>)
     text = _convert_table_blocks(text)
+    # Готовые <pre> прячем от дальнейшей обработки: и markdown-конвертер, и
+    # финальная чистка пробелов срезают отступы в начале строк, а на них
+    # держится вёрстка таблиц и списков.
+    pre_blocks = []
+
+    def _stash(match):
+        pre_blocks.append(match.group(0))
+        return f"zqPREBLOCK{len(pre_blocks) - 1}qz"
+
+    text = re.sub(r'<pre>.*?</pre>', _stash, text, flags=re.S)
     # Заголовки --> жирный текст (h1-h6 не поддерживаются)
     text = re.sub(r'(?m)^(#{1,6})\s+(.+)$', lambda m: f"<b>{m.group(2)}</b>", text)
     # HR --> разделитель
@@ -915,6 +923,9 @@ def md_to_html(text: str) -> str:
     # Схлопываем избыточные переносы
     html = re.sub(r' *\n *', '\n', html)
     html = re.sub(r'\n{3,}', '\n\n', html)
+    # Возвращаем <pre> последним шагом, чтобы содержимое не тронули регулярки
+    for index, block in enumerate(pre_blocks):
+        html = html.replace(f"zqPREBLOCK{index}qz", block)
     return html.strip()
 
 
