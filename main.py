@@ -60,7 +60,6 @@ PROVIDERS = {
 }
 
 # Пользовательские настройки: chat_id -> {provider, model}
-USER_SETTINGS = {}
 DEFAULT_PROVIDER = "nvidia"
 
 # ============ ROADMAP (конфигурация уровней и стека) ============
@@ -944,22 +943,38 @@ def should_respond(update: Update) -> bool:
 
 
 def get_user_settings(chat_id: int) -> dict:
-    """Получает настройки пользователя (провайдер, модель)."""
-    return USER_SETTINGS.get(chat_id, {"provider": DEFAULT_PROVIDER})
+    """Провайдер и модель чата.
+
+    Лежат вместе с остальными настройками в progress.json: раньше это был
+    словарь в памяти, и выбор модели слетал при каждом перезапуске — а бот
+    перезапускается по расписанию каждый день.
+
+    Неизвестные значения (например, провайдер qwen из старых версий или
+    модель, убранная из меню) молча заменяются на дефолтные.
+    """
+    stored = _get_user_settings(chat_id)
+    provider = stored.get("provider")
+    if provider not in PROVIDERS:
+        provider = DEFAULT_PROVIDER
+    model = stored.get("model")
+    if model not in PROVIDERS[provider]["models"]:
+        model = PROVIDERS[provider]["default"]
+    return {"provider": provider, "model": model}
 
 
-def set_user_provider(chat_id: int, provider: str):
-    if chat_id not in USER_SETTINGS:
-        USER_SETTINGS[chat_id] = {"provider": DEFAULT_PROVIDER}
-    USER_SETTINGS[chat_id]["provider"] = provider
+async def set_user_provider(chat_id: int, provider: str):
+    stored = _get_user_settings(chat_id)
+    stored["provider"] = provider
     # Сбрасываем модель на дефолт для нового провайдера
-    USER_SETTINGS[chat_id]["model"] = PROVIDERS[provider]["default"]
+    stored["model"] = PROVIDERS[provider]["default"]
+    await _save_user_config()
 
 
-def set_user_model(chat_id: int, model_key: str):
-    if chat_id not in USER_SETTINGS:
-        USER_SETTINGS[chat_id] = {"provider": DEFAULT_PROVIDER}
-    USER_SETTINGS[chat_id]["model"] = model_key
+async def set_user_model(chat_id: int, model_key: str):
+    stored = _get_user_settings(chat_id)
+    stored.setdefault("provider", DEFAULT_PROVIDER)
+    stored["model"] = model_key
+    await _save_user_config()
 
 
 def get_current_model(chat_id: int) -> tuple[str, str]:
@@ -1182,8 +1197,8 @@ def build_roadmap_level_text(chat_id: int, index: int) -> str:
     return "\n".join(lines)
 
 
-async def call_provider_api(provider_key: str, model_id: str, messages: list[dict], stream: bool = True, temperature: float = 0.6) -> AsyncGenerator[tuple[str, dict], None]:
-    """Универсальный вызов API провайдера."""
+async def _stream_model(provider_key: str, model_id: str, messages: list[dict], stream: bool = True, temperature: float = 0.6) -> AsyncGenerator[tuple[str, dict], None]:
+    """Одна попытка стриминга у конкретной модели, без повторов."""
     provider = PROVIDERS[provider_key]
     api_key = provider["api_key"]
     api_url = provider["api_url"]
@@ -1292,9 +1307,9 @@ def split_markdown(text: str, limit: int = SAFE_CHUNK) -> list[str]:
     return chunks
 
 
-async def call_provider_api_once(provider_key: str, model_id: str, messages: list[dict],
-                                 tools: list[dict] | None = None,
-                                 temperature: float = 0.3) -> dict:
+async def _call_model_once(provider_key: str, model_id: str, messages: list[dict],
+                           tools: list[dict] | None = None,
+                           temperature: float = 0.3) -> dict:
     """Нестриминговый вызов: возвращает message целиком, включая tool_calls.
 
     Нужен циклу веб-поиска: там важно увидеть решение модели разом, а склеивать
@@ -1327,6 +1342,79 @@ async def call_provider_api_once(provider_key: str, model_id: str, messages: lis
                 f"API error: {response.status_code}", request=response.request, response=response
             )
         return response.json()["choices"][0]["message"]
+
+RETRY_STATUSES = (429, 500, 502, 503, 529)
+RETRY_DELAYS = (2, 6)  # паузы перед повторами одной и той же модели, секунды
+MAX_FALLBACKS = 2      # сколько запасных моделей пробовать, чтобы не ждать вечно
+
+
+def _fallback_models(provider_key: str, model_id: str) -> list[str]:
+    """Текущая модель, затем несколько запасных из меню того же провайдера."""
+    others = [m for m in PROVIDERS[provider_key]["models"].values() if m != model_id]
+    return [model_id] + others[:MAX_FALLBACKS]
+
+
+def _is_retryable(error: Exception) -> bool:
+    """Повторяем таймауты, обрывы и временные коды. На 401/404 смысла нет."""
+    if isinstance(error, httpx.HTTPStatusError):
+        return error.response.status_code in RETRY_STATUSES
+    return isinstance(error, httpx.HTTPError)
+
+
+async def call_provider_api(provider_key: str, model_id: str, messages: list[dict],
+                            stream: bool = True, temperature: float = 0.6,
+                            on_fallback=None) -> AsyncGenerator[tuple[str, dict], None]:
+    """Стриминг с повторами и подменой модели при отказе.
+
+    Повторяем только пока не отдан ни один токен: если ответ уже начал
+    печататься, переключаться нельзя — получится склейка двух разных ответов.
+    """
+    last_error = None
+    for position, candidate in enumerate(_fallback_models(provider_key, model_id)):
+        for attempt in range(len(RETRY_DELAYS) + 1):
+            started = False
+            try:
+                async for token, usage in _stream_model(provider_key, candidate, messages,
+                                                        stream=stream, temperature=temperature):
+                    if not started:
+                        started = True
+                        if position > 0 and on_fallback:
+                            await on_fallback(candidate)
+                    yield token, usage
+                return
+            except httpx.HTTPError as e:
+                if started:
+                    raise  # поток уже пошёл, молча менять модель нельзя
+                last_error = e
+                if _is_retryable(e) and attempt < len(RETRY_DELAYS):
+                    logger.warning(f"{candidate}: {e}; повтор через {RETRY_DELAYS[attempt]}с")
+                    await asyncio.sleep(RETRY_DELAYS[attempt])
+                    continue
+                break
+        logger.warning(f"Модель {candidate} не ответила, пробую запасную")
+    raise last_error or RuntimeError("Ни одна модель не ответила")
+
+
+async def call_provider_api_once(provider_key: str, model_id: str, messages: list[dict],
+                                 tools: list[dict] | None = None,
+                                 temperature: float = 0.3) -> dict:
+    """Нестриминговый вызов с теми же повторами и запасными моделями."""
+    last_error = None
+    for candidate in _fallback_models(provider_key, model_id):
+        for attempt in range(len(RETRY_DELAYS) + 1):
+            try:
+                return await _call_model_once(provider_key, candidate, messages,
+                                              tools=tools, temperature=temperature)
+            except httpx.HTTPError as e:
+                last_error = e
+                if _is_retryable(e) and attempt < len(RETRY_DELAYS):
+                    logger.warning(f"{candidate}: {e}; повтор через {RETRY_DELAYS[attempt]}с")
+                    await asyncio.sleep(RETRY_DELAYS[attempt])
+                    continue
+                break
+        logger.warning(f"Модель {candidate} не ответила, пробую запасную")
+    raise last_error or RuntimeError("Ни одна модель не ответила")
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -2159,7 +2247,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("provider:"):
         provider_key = data.split(":")[1]
         if provider_key in PROVIDERS:
-            set_user_provider(chat_id, provider_key)
+            await set_user_provider(chat_id, provider_key)
             provider_name = PROVIDERS[provider_key]["name"]
             await query.answer()
             await query.edit_message_text(
@@ -2173,7 +2261,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         provider_key = settings.get("provider", DEFAULT_PROVIDER)
         # Проверяем что модель существует у текущего провайдера
         if model_key in PROVIDERS[provider_key]["models"]:
-            set_user_model(chat_id, model_key)
+            await set_user_model(chat_id, model_key)
             await query.answer()
             await query.edit_message_text(
                 f"{emoji('check')} Модель изменена на <b>{model_key}</b>",
@@ -2487,8 +2575,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     timer_task = asyncio.create_task(timer_updater())
 
+    fallback_model = None
+
+    async def note_fallback(model: str):
+        # Запасная модель отвечает иначе — честнее сказать об этом, чем
+        # оставить пользователя гадать, почему ответ не такой, как обычно.
+        nonlocal fallback_model
+        fallback_model = model
+
     try:
-        async for token, u in call_provider_api(provider_key, model_id, messages):
+        async for token, u in call_provider_api(provider_key, model_id, messages,
+                                                on_fallback=note_fallback):
             all_parts.append(token)
             full_text = "".join(all_parts)
             if u:
@@ -2568,7 +2665,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # полная версия публикуется на telegra.ph: её ссылка раскрывается в клиенте
     # окном Instant View, а в чате остаётся начало ответа.
     header = f"{emoji('brain')} <b>Ответ</b> <i>({elapsed}с)</i>\n\n"
-    footer = f"{sources_block}{token_info}"
+    fallback_note = (
+        f"\n\n{emoji('warning')} <i>Основная модель не ответила, отвечала {fallback_model}</i>"
+        if fallback_model else ""
+    )
+    footer = f"{fallback_note}{sources_block}{token_info}"
     body_html = md_to_html(full_text)
     page_url = None
 
