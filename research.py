@@ -32,6 +32,7 @@ MAX_QUERIES = 5              # формулировок за один вызов
 MAX_RESULTS = 6              # источников на одну формулировку
 MAX_CHARS_PER_SOURCE = 1500  # обрезка выжимки одного источника
 MAX_CHARS_TOTAL = 14000      # потолок текста поиска на один круг
+MAX_IMAGES = 6              # картинок в каталоге для модели
 SEARCH_TIMEOUT = 30.0
 
 TOOLS = [
@@ -102,6 +103,10 @@ async def search(query: str, max_results: int = MAX_RESULTS) -> list[dict]:
         "search_depth": "advanced",
         "include_raw_content": False,
         "include_answer": False,
+        # Картинки нужны для иллюстраций на странице Telegraph. Описания
+        # обязательны: по ним модель решает, уместна ли картинка вообще.
+        "include_images": True,
+        "include_image_descriptions": True,
     }
     async with httpx.AsyncClient(timeout=SEARCH_TIMEOUT) as client:
         response = await client.post(
@@ -118,7 +123,16 @@ async def search(query: str, max_results: int = MAX_RESULTS) -> list[dict]:
             "url": (item.get("url") or "").strip(),
             "content": content[:MAX_CHARS_PER_SOURCE],
         })
-    return results
+
+    images = []
+    for item in data.get("images") or []:
+        if isinstance(item, dict):
+            url, description = item.get("url"), item.get("description") or ""
+        else:
+            url, description = item, ""
+        if url:
+            images.append({"url": str(url), "description": str(description).strip()})
+    return results, images
 
 
 def format_results(queries: list[str], results: list[dict]) -> str:
@@ -136,6 +150,18 @@ def format_results(queries: list[str], results: list[dict]) -> str:
         parts.append(block)
         total += len(block)
     return "\n".join(parts)
+
+
+def format_images(images: list[dict], offset: int = 0) -> str:
+    """Каталог картинок для модели: она сама решит, какие уместны."""
+    if not images:
+        return ""
+    lines = ["Доступные изображения. Если картинка уместна по смыслу — вставь маркер "
+             "[imgN] отдельной строкой в нужном месте ответа. Нерелевантные и "
+             "декоративные не вставляй:"]
+    for i, item in enumerate(images, offset + 1):
+        lines.append(f"[img{i}] {item['description'][:200]}")
+    return "\n".join(lines)
 
 
 def _extract_queries(call: dict) -> list[str]:
@@ -167,31 +193,36 @@ def _extract_queries(call: dict) -> list[str]:
     return queries[:MAX_QUERIES]
 
 
-async def _search_all(queries: list[str]) -> tuple[list[dict], list[str]]:
+async def _search_all(queries: list[str]) -> tuple[list[dict], list[str], list[dict]]:
     """Ищет по всем формулировкам параллельно, сливает выдачу без дублей.
 
-    Возвращает (уникальные результаты, тексты ошибок по неудавшимся запросам).
+    Возвращает (результаты, ошибки, картинки) — всё без дублей по URL.
     """
     batches = await asyncio.gather(
         *(search(q) for q in queries), return_exceptions=True
     )
 
-    merged, errors, seen = [], [], set()
+    merged, errors, images, seen, seen_img = [], [], [], set(), set()
     for query, batch in zip(queries, batches):
         if isinstance(batch, Exception):
             logger.error(f"research: поиск не удался ({query}): {batch}")
             errors.append(f"Запрос «{query}» не удался: {batch}")
             continue
-        for item in batch:
+        found, found_images = batch
+        for item in found:
             url = item.get("url")
             if url and url not in seen:
                 seen.add(url)
                 merged.append(item)
-    return merged, errors
+        for item in found_images:
+            if item["url"] not in seen_img and item.get("description"):
+                seen_img.add(item["url"])
+                images.append(item)
+    return merged, errors, images
 
 
 async def run_tool_loop(llm_call, messages: list[dict], *, max_rounds: int = MAX_ROUNDS,
-                        on_progress=None) -> tuple[list[dict], list[dict]]:
+                        on_progress=None) -> tuple[list[dict], list[dict], list[dict]]:
     """Гоняет модель по кругу «решает → ищем → отдаём результат».
 
     llm_call(messages, tools) -> dict — нестриминговый вызов модели, возвращает
@@ -199,13 +230,15 @@ async def run_tool_loop(llm_call, messages: list[dict], *, max_rounds: int = MAX
     on_progress(line) — необязательный async-колбэк: строка прогресса для показа
     пользователю (запрос или найденный сайт).
 
-    Возвращает (messages, sources): диалог, дополненный результатами поиска,
-    и список использованных источников [{title, url}] без дублей.
+    Возвращает (messages, sources, images): диалог с результатами поиска,
+    использованные источники [{title, url}] и каталог картинок
+    [{url, description}] — всё без дублей.
     """
     messages = list(messages)
     sources: list[dict] = []
     seen_urls: set[str] = set()
     searched: set[str] = set()  # формулировки, уже отправленные в поиск
+    images: list[dict] = []     # каталог иллюстраций для страницы Telegraph
 
     async def progress(line: str):
         if on_progress:
@@ -249,7 +282,7 @@ async def run_tool_loop(llm_call, messages: list[dict], *, max_rounds: int = MAX
                 for query in fresh:
                     await progress(f"🔍 {query}")
 
-                found, errors = await _search_all(fresh)
+                found, errors, found_images = await _search_all(fresh)
 
                 for item in found:
                     if item["url"] and item["url"] not in seen_urls:
@@ -258,6 +291,15 @@ async def run_tool_loop(llm_call, messages: list[dict], *, max_rounds: int = MAX
                         await progress(f"📄 {domain_of(item['url'])} — {item['title'][:60]}")
 
                 result_text = format_results(fresh, found)
+
+                known = {x["url"] for x in images}
+                fresh_images = [x for x in found_images
+                                if x["url"] not in known][:MAX_IMAGES - len(images)]
+                if fresh_images:
+                    offset = len(images)
+                    images.extend(fresh_images)
+                    result_text += "\n\n" + format_images(fresh_images, offset)
+
                 if errors:
                     # Ошибки отдаём модели текстом: пусть учтёт или переформулирует,
                     # но весь круг из-за одного упавшего запроса не теряем.
@@ -272,4 +314,4 @@ async def run_tool_loop(llm_call, messages: list[dict], *, max_rounds: int = MAX
         if round_no == max_rounds:
             logger.info(f"research: достигнут потолок в {max_rounds} круга поиска")
 
-    return messages, sources
+    return messages, sources, images

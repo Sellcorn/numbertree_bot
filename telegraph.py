@@ -62,8 +62,15 @@ def _inline(text: str) -> list:
     return nodes or [text]
 
 
-def markdown_to_nodes(md: str) -> list:
-    """Переводит markdown в массив узлов Telegraph."""
+def markdown_to_nodes(md: str, images: list[dict] | None = None) -> list:
+    """Переводит markdown в массив узлов Telegraph.
+
+    Маркер [imgN] отдельной строкой заменяется картинкой из каталога images
+    (нумерация с единицы). Модель расставляет маркеры сама — она видела
+    описания и решает, где картинка уместна.
+    """
+    images = images or []
+    used_images: set[int] = set()  # одну картинку показываем один раз
     lines = (md or "").replace("\r\n", "\n").split("\n")
     nodes: list = []
     para: list[str] = []
@@ -88,6 +95,21 @@ def markdown_to_nodes(md: str) -> list:
     i = 0
     while i < len(lines):
         stripped = lines[i].strip()
+
+        marker = re.fullmatch(r"\[img(\d+)\]", stripped)
+        if marker:
+            flush_para(); flush_list()
+            index = int(marker.group(1)) - 1
+            if 0 <= index < len(images) and index not in used_images:
+                used_images.add(index)
+                item = images[index]
+                children = [{"tag": "img", "attrs": {"src": item["url"]}}]
+                caption = (item.get("description") or "").strip()
+                if caption:
+                    children.append({"tag": "figcaption", "children": [caption[:200]]})
+                nodes.append({"tag": "figure", "children": children})
+            i += 1
+            continue
 
         if stripped.startswith("```"):
             flush_para(); flush_list()
@@ -185,7 +207,7 @@ async def _get_token() -> str | None:
     return None
 
 
-async def publish(title: str, markdown_text: str,
+async def publish(title: str, markdown_text: str, images: list[dict] | None = None,
                   author_name: str = "numbertree_bot") -> str | None:
     """Публикует markdown страницей и возвращает URL. None — если не вышло.
 
@@ -195,7 +217,7 @@ async def publish(title: str, markdown_text: str,
     if not token:
         return None
 
-    nodes = markdown_to_nodes(markdown_text)
+    nodes = markdown_to_nodes(markdown_text, images)
     if not nodes:
         return None
 

@@ -2379,6 +2379,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Веб-поиск: решает сама модель через tool calling. Без ключа Tavily
     # шаг пропускается целиком и бот отвечает как раньше.
     sources = []
+    images = []
     if research.is_enabled():
         progress_lines = []
         last_progress_edit = 0.0
@@ -2414,7 +2415,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await call_provider_api_once(provider_key, model_id, msgs, tools=tools)
 
         try:
-            messages, sources = await research.run_tool_loop(
+            messages, sources, images = await research.run_tool_loop(
                 llm_call, messages, on_progress=on_progress
             )
         except Exception as e:
@@ -2440,7 +2441,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "пункт из найденного, приводи конкретику — версии, даты, названия, "
                     "примеры кода. Объём не ограничен, но воды быть не должно: "
                     "каждый абзац несёт факт.\n"
-                    "4. Последней строкой добавь ровно в таком виде: "
+                    "4. Если в результатах поиска был каталог изображений — вставь "
+                    "уместные маркеры [imgN] отдельными строками между разделами: "
+                    "они станут иллюстрациями. Ставь только по делу, декоративные "
+                    "и не относящиеся к теме пропускай.\n"
+                    "5. Последней строкой добавь ровно в таком виде: "
                     "«Достоверность: высокая/средняя/низкая — одно предложение почему». "
                     "Высокая — подтверждено официальным источником или несколькими "
                     "независимыми; низкая — один источник, блог или противоречия в выдаче."
@@ -2517,6 +2522,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await timer_task
 
     full_text = "".join(all_parts).strip()
+    # Маркеры [imgN] нужны только странице Telegraph — там они станут
+    # картинками. В сообщении и в истории диалога они лишний шум.
+    page_text = full_text
+    full_text = re.sub(r'(?m)^\[img\d+\]\s*$', '', full_text).strip()
     elapsed = int(asyncio.get_event_loop().time() - start_time)
 
     # Сохраняем в историю
@@ -2564,7 +2573,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(header) + len(body_html) + len(footer) <= TELEGRAM_LIMIT:
         final_text = header + body_html + footer
     else:
-        page_url = await telegraph.publish(user_text[:200] or "Ответ", full_text)
+        page_url = await telegraph.publish(user_text[:200] or "Ответ", page_text, images)
         if page_url:
             link = (f'\n\n📖 <a href="{page_url}">Читать полностью '
                     f'({len(full_text)} символов)</a>')
