@@ -9,6 +9,8 @@ from typing import AsyncGenerator
 
 import httpx
 import markdown
+
+import research
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, PollAnswerHandler, filters, ContextTypes, ChatMemberHandler
@@ -1199,6 +1201,43 @@ async def call_provider_api(provider_key: str, model_id: str, messages: list[dic
                 yield "", usage
 
 
+
+async def call_provider_api_once(provider_key: str, model_id: str, messages: list[dict],
+                                 tools: list[dict] | None = None,
+                                 temperature: float = 0.3) -> dict:
+    """Нестриминговый вызов: возвращает message целиком, включая tool_calls.
+
+    Нужен циклу веб-поиска: там важно увидеть решение модели разом, а склеивать
+    tool_calls из потока фрагментов — лишняя морока и источник ошибок.
+    """
+    provider = PROVIDERS[provider_key]
+    api_key = provider["api_key"]
+    if not api_key:
+        raise ValueError(f"API key not set for {provider_key}")
+
+    payload = {
+        "model": model_id,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": 2048,
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        response = await client.post(provider["api_url"], headers=headers, json=payload)
+        if response.status_code != 200:
+            logger.error(f"{provider['name']} API error {response.status_code}: {response.text[:300]}")
+            raise httpx.HTTPStatusError(
+                f"API error: {response.status_code}", request=response.request, response=response
+            )
+        return response.json()["choices"][0]["message"]
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"{emoji('rocket')} <b>Бот готов к работе</b>\n\n"
@@ -2240,12 +2279,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for h in history:
         messages.append({"role": "user", "content": h["user"]})
         messages.append({"role": "assistant", "content": h["assistant"]})
-    messages.append({"role": "user", "content": f"ТЫ ОБЯЗАН ОТВЕЧАТЬ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ. ЗАПРЕЩЕНО ИСПОЛЬЗОВАТЬ HTML-ТЕГИ (<hr>, <strong>, <b>, <ol>, <ul>, <li>, <h1>, <h2>, <h3>, <p>, <div>, <span> И ДРУГИЕ). ИСПОЛЬЗУЙ ТОЛЬКО MARKDOWN: **жирный**, *курсив*, `код`, ```блоки кода```, - списки, 1. нумерованные списки, > цитаты. ОТВЕЧАЙ СРАЗУ И ЧЁТКО, БЕЗ РАССУЖДЕНИЙ. СТРУКТУРИРУЙ ОТВЕТ: короткое вступление, затем разделы/списки/код. ЕСЛИ ЗАДАЛИ ВОПРОС (о викторине, коде или чём угодно) — ОТВЕЧАЙ ПРЯМО НА НЕГО. ВОПРОС: {user_text}"})
+    messages.append({"role": "user", "content": f"Сегодня {datetime.now().strftime('%d.%m.%Y')}. Твои внутренние знания устарели: если вопрос касается событий, версий, релизов, цен или новостей — опирайся на результаты веб-поиска, а не на память, и не выдавай устаревшие данные за актуальные. ТЫ ОБЯЗАН ОТВЕЧАТЬ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ. ЗАПРЕЩЕНО ИСПОЛЬЗОВАТЬ HTML-ТЕГИ (<hr>, <strong>, <b>, <ol>, <ul>, <li>, <h1>, <h2>, <h3>, <p>, <div>, <span> И ДРУГИЕ). ИСПОЛЬЗУЙ ТОЛЬКО MARKDOWN: **жирный**, *курсив*, `код`, ```блоки кода```, - списки, 1. нумерованные списки, > цитаты. ОТВЕЧАЙ СРАЗУ И ЧЁТКО, БЕЗ РАССУЖДЕНИЙ. СТРУКТУРИРУЙ ОТВЕТ: короткое вступление, затем разделы/списки/код. ЕСЛИ ЗАДАЛИ ВОПРОС (о викторине, коде или чём угодно) — ОТВЕЧАЙ ПРЯМО НА НЕГО. ВОПРОС: {user_text}"})
 
     all_parts = []
     last_edit_len = 0
     start_time = asyncio.get_event_loop().time()
     usage = {}
+
+    # Веб-поиск: решает сама модель через tool calling. Без ключа Tavily
+    # шаг пропускается целиком и бот отвечает как раньше.
+    sources = []
+    if research.is_enabled():
+        async def on_progress(text: str):
+            try:
+                await thinking_msg.edit_text(
+                    f"{emoji('thinking')} <b>{text}</b>", parse_mode=ParseMode.HTML
+                )
+            except Exception:
+                pass
+
+        async def llm_call(msgs, tools):
+            return await call_provider_api_once(provider_key, model_id, msgs, tools=tools)
+
+        try:
+            messages, sources = await research.run_tool_loop(
+                llm_call, messages, on_progress=on_progress
+            )
+        except Exception as e:
+            # Поиск не критичен: отвечаем по памяти, но честно логируем.
+            logger.error(f"Веб-поиск не удался, отвечаю без него: {e}")
+
+        if sources:
+            try:
+                await thinking_msg.edit_text(
+                    f"{emoji('thinking')} <b>Формулирую ответ по {len(sources)} источникам...</b>",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
 
     # Фоновая задача для обновления таймера каждые 2 секунды
     stop_timer = asyncio.Event()
@@ -2327,10 +2398,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_tokens = usage.get("total_tokens", 0)
         token_info = f"\n\n{emoji('code')} <b>Токены:</b> {prompt_tokens} + {completion_tokens} = {total_tokens}"
 
+    # Источники, если бот ходил в интернет
+    sources_block = ""
+    if sources:
+        def _esc(s):
+            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        links = "\n".join(
+            f'{i}. <a href="{_esc(s["url"])}">{_esc(s["title"] or s["url"])[:70]}</a>'
+            for i, s in enumerate(sources[:6], 1)
+        )
+        sources_block = f"\n\n{emoji('spark')} <b>Источники:</b>\n{links}"
+
     # Красивый финальный ответ с мозгом 🧠
     final_text = (
         f"{emoji('brain')} <b>Ответ</b> <i>({elapsed}с)</i>\n\n"
         f"{md_to_html(full_text)}"
+        f"{sources_block}"
         f"{token_info}"
     )
 
