@@ -56,6 +56,11 @@ PROVIDERS = {
             "minimax-m3": "minimaxai/minimax-m3",
         },
         "default": "super-120b",
+        # Размер контекста NVIDIA в API не сообщает (в /v1/models только id и
+        # owner) и переполнение не отвергает. Значение измерено: все пять
+        # моделей приняли промпт на 115k токенов, super-120b — на 360k.
+        # Берём консервативные 128k как ориентир для индикатора.
+        "context": 128000,
     },
 }
 
@@ -2646,6 +2651,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         completion_tokens = usage.get("completion_tokens", 0)
         total_tokens = usage.get("total_tokens", 0)
         token_info = f"\n\n{emoji('code')} <b>Токены:</b> {prompt_tokens} + {completion_tokens} = {total_tokens}"
+        window = PROVIDERS[provider_key].get("context")
+        if window:
+            percent = round(total_tokens * 100 / window)
+            spaced = lambda n: f"{n:,}".replace(",", " ")
+            token_info += (f"\n{emoji('brain')} <b>Контекст:</b> "
+                           f"{spaced(total_tokens)} / {spaced(window)} ({percent}%)")
 
     # Источники — компактной строкой после текста, без отдельного заголовка
     sources_block = ""
