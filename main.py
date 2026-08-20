@@ -2363,6 +2363,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Поиск не критичен: отвечаем по памяти, но честно логируем.
             logger.error(f"Веб-поиск не удался, отвечаю без него: {e}")
 
+        if sources:
+            # Инструкция идёт последней репликой, чтобы модель применила её
+            # именно к найденному, а не потеряла среди результатов поиска.
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Теперь ответь на исходный вопрос по найденному. Правила:\n"
+                    "1. Сверь факты между источниками. Если они расходятся — прямо скажи, "
+                    "в чём именно и кому верить.\n"
+                    "2. Больше доверяй официальным источникам (документация, релиз-ноуты, "
+                    "сайт проекта), меньше — блогам, агрегаторам, соцсетям и видео.\n"
+                    "3. Отвечай СЖАТО: только суть, без воды и без пересказа источников "
+                    "целиком. Уложись примерно в 250 слов.\n"
+                    "4. Последней строкой добавь ровно в таком виде: "
+                    "«Достоверность: высокая/средняя/низкая — одно предложение почему». "
+                    "Высокая — подтверждено официальным источником или несколькими "
+                    "независимыми; низкая — один источник, блог или противоречия в выдаче."
+                ),
+            })
+
         if progress_lines:
             # Финальный сброс: показать всё, что не успело попасть из-за троттлинга.
             footer = (f"<b>Прочитал {len(sources)} источников, формулирую ответ...</b>"
@@ -2383,7 +2403,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elapsed = int(asyncio.get_event_loop().time() - start_time)
             preview = "".join(all_parts)[-2500:] if all_parts else ""
             timer_text = (
-                f"{emoji('thinking')} <b>Обрабатываю...</b> ⏱ <i>{elapsed}с</i> ({provider_name})\n\n"
+                f"{emoji('thinking')} <b>Пишу ответ...</b> ⏱ <i>{elapsed}с</i> ({provider_name})\n\n"
                 f"<blockquote expandable>{preview}</blockquote>"
             )
             if timer_text != last_timer_text:
@@ -2411,7 +2431,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 async with edit_lock:
                     try:
                         await thinking_msg.edit_text(
-                            f"{emoji('thinking')} <b>Обрабатываю...</b> ⏱ <i>{elapsed}с</i> ({provider_name})\n\n"
+                            f"{emoji('thinking')} <b>Пишу ответ...</b> ⏱ <i>{elapsed}с</i> ({provider_name})\n\n"
                             f"<blockquote expandable>{preview}</blockquote>",
                             parse_mode=ParseMode.HTML
                         )
@@ -2449,16 +2469,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total_tokens = usage.get("total_tokens", 0)
         token_info = f"\n\n{emoji('code')} <b>Токены:</b> {prompt_tokens} + {completion_tokens} = {total_tokens}"
 
-    # Источники, если бот ходил в интернет
+    # Источники — компактной строкой после текста, без отдельного заголовка
     sources_block = ""
     if sources:
-        def _esc(s):
+        def _esc(s: str) -> str:
             return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        links = "\n".join(
-            f'{i}. <a href="{_esc(s["url"])}">{_esc(s["title"] or s["url"])[:70]}</a>'
-            for i, s in enumerate(sources[:6], 1)
+
+        # Схлопываем до доменов: 25 ссылок списком читать невозможно,
+        # а домен сразу показывает, официальный это источник или блог.
+        by_domain = {}
+        for item in sources:
+            by_domain.setdefault(research.domain_of(item["url"]), item["url"])
+        shown = list(by_domain.items())[:8]
+        links = ", ".join(
+            f'<a href="{_esc(url)}">{_esc(dom)}</a>' for dom, url in shown
         )
-        sources_block = f"\n\n{emoji('spark')} <b>Источники:</b>\n{links}"
+        more = "" if len(by_domain) <= len(shown) else f" и ещё {len(by_domain) - len(shown)}"
+        sources_block = f"\n\n<i>Источники: {links}{more}</i>"
 
     # Красивый финальный ответ с мозгом 🧠
     final_text = (
