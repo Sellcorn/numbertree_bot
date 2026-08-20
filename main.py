@@ -38,10 +38,20 @@ PROVIDERS = {
         "name": "NVIDIA",
         "api_key": os.getenv("NVIDIA_API_KEY"),
         "api_url": f"{NVIDIA_API_BASE}/chat/completions",
+        # Скорость замерена одним промптом в одном окне (ток/с, первый токен):
+        #   super-120b     115 ток/с, 1.3с — класс M3, но кратно быстрее
+        #   lightning-30b  149 ток/с, 4.0с — самая быстрая, модель полегче
+        #   ultra-550b      47 ток/с, 3.4с — самая мощная из доступных
+        #   inkling         36 ток/с, 7.5с
+        #   minimax-m3    7-17 ток/с, 2.7с — заметно медленнее остальных
         "models": {
+            "super-120b": "nvidia/nemotron-3-super-120b-a12b",
+            "ultra-550b": "nvidia/nemotron-3-ultra-550b-a55b",
+            "lightning-30b": "nvidia/nemotron-3.5-lightning-30b-a3b",
+            "inkling": "thinkingmachines/inkling",
             "minimax-m3": "minimaxai/minimax-m3",
         },
-        "default": "minimax-m3",
+        "default": "super-120b",
     },
 }
 
@@ -1210,7 +1220,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 continue  # Не приветствуем самого бота
             await update.message.reply_text(
                 f"{emoji('rocket')} <b>Привет, {member.mention_html()}!</b>\n\n"
-                f"{emoji('brain')} Я ИИ-ассистент на базе MiniMax M3 (NVIDIA API).\n"
+                f"{emoji('brain')} Я ИИ-ассистент на моделях NVIDIA API.\n"
                 f"{emoji('gear')} Отвечаю по @numbertree_bot или reply.\n\n"
                 f"Выберите модель и провайдера:",
                 parse_mode=ParseMode.HTML,
