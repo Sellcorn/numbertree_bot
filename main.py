@@ -2322,13 +2322,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # шаг пропускается целиком и бот отвечает как раньше.
     sources = []
     if research.is_enabled():
-        async def on_progress(text: str):
+        progress_lines = []
+        last_progress_edit = 0.0
+
+        def _esc_line(s: str) -> str:
+            return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        async def render_progress(footer: str = ""):
+            # Показываем хвост: строк набегает много, а у Telegram лимит 4096 символов.
+            shown = "\n".join(_esc_line(l) for l in progress_lines[-14:])
+            tail = f"\n\n{footer}" if footer else ""
             try:
                 await thinking_msg.edit_text(
-                    f"{emoji('thinking')} <b>{text}</b>", parse_mode=ParseMode.HTML
+                    f"{emoji('thinking')} <b>Ищу в интернете...</b>\n\n{shown}{tail}",
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
                 )
             except Exception:
                 pass
+
+        async def on_progress(line: str):
+            nonlocal last_progress_edit
+            progress_lines.append(line)
+            # Троттлинг: на один ответ приходится под полсотни строк, и без паузы
+            # Telegram включает флуд-контроль на правках сообщения.
+            now = asyncio.get_event_loop().time()
+            if now - last_progress_edit < 1.2:
+                return
+            last_progress_edit = now
+            await render_progress()
 
         async def llm_call(msgs, tools):
             return await call_provider_api_once(provider_key, model_id, msgs, tools=tools)
@@ -2341,14 +2363,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Поиск не критичен: отвечаем по памяти, но честно логируем.
             logger.error(f"Веб-поиск не удался, отвечаю без него: {e}")
 
-        if sources:
-            try:
-                await thinking_msg.edit_text(
-                    f"{emoji('thinking')} <b>Формулирую ответ по {len(sources)} источникам...</b>",
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception:
-                pass
+        if progress_lines:
+            # Финальный сброс: показать всё, что не успело попасть из-за троттлинга.
+            footer = (f"<b>Прочитал {len(sources)} источников, формулирую ответ...</b>"
+                      if sources else "")
+            await render_progress(footer)
 
     # Фоновая задача для обновления таймера каждые 2 секунды
     stop_timer = asyncio.Event()
