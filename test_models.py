@@ -1,23 +1,22 @@
-import os
+"""Проверяет, что конкретные id моделей отвечают на короткий запрос.
+
+    python test_models.py minimaxai/minimax-m2 minimaxai/minimax-m1-80k
+"""
+import sys
+
 import httpx
-import json
 
-os.environ['NVIDIA_API_KEY'] = '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'
+from _keyhelper import API_BASE, headers
 
-headers = {
-    'Authorization': f'Bearer {os.environ["NVIDIA_API_KEY"]}',
-    'Content-Type': 'application/json',
-}
-
-models = [
-    'deepseek-ai/deepseek-r1',
-    'deepseek-r1',
-    'nvidia/deepseek-r1',
-    'deepseek-ai/deepseek-r1-distill-llama-70b',
-    'nvidia/nemotron-3-ultra',
-]
+models = sys.argv[1:]
+if not models:
+    sys.exit("Укажите id моделей: python test_models.py <model_id> [<model_id> ...]")
 
 for model in models:
-    payload = {'model': model, 'messages': [{'role': 'user', 'content': 'test'}], 'max_tokens': 10}
-    r = httpx.post('https://integrate.api.nvidia.com/v1/chat/completions', headers=headers, json=payload, timeout=30)
-    print(f'{model}: {r.status_code} - {r.text[:200]}')
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "test"}],
+        "max_tokens": 10,
+    }
+    r = httpx.post(f"{API_BASE}/chat/completions", headers=headers(), json=payload, timeout=60)
+    print(f"{model}: {r.status_code} - {r.text[:200]}")

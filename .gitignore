@@ -4,3 +4,6 @@ __pycache__/
 *.pyc
 progress.json
 progress.json.tmp
+
+# логи запуска (содержат токен бота в URL-ах httpx)
+*.log

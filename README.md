@@ -1,6 +1,6 @@
-# Qwen Telegram Bot
+# MiniMax Telegram Bot
 
-Telegram-бот на базе Qwen 3.6 Flash (QwenCloud Token Plan) со стримингом ответов и отображением процесса рассуждений.
+Telegram-бот на базе MiniMax M3 (NVIDIA API) со стримингом ответов и отображением процесса рассуждений.
 
 ## Возможности
 - Показывает процесс «думания» поэтапно (таймер + предпросмотр ответа)
@@ -20,7 +20,7 @@ Telegram-бот на базе Qwen 3.6 Flash (QwenCloud Token Plan) со стр�
 ## Установка
 
 ```bash
-cd nvidia_telegram_bot
+cd numbertree_bot
 
 python -m venv venv
 venv\Scripts\activate  # Windows
@@ -40,13 +40,22 @@ cp .env.example .env
 3. Следуйте инструкциям
 4. Скопируйте токен в `.env` как `TELEGRAM_BOT_TOKEN`
 
-### Qwen API Key
-1. Зарегистрируйтесь на [home.qwencloud.com](https://home.qwencloud.com/)
-2. Оформите подписку Token Plan и создайте API Key (начинается с `sk-sp-`)
-3. Скопируйте в `.env` как `QWEN_API_KEY`
+### NVIDIA API Key
+1. Зарегистрируйтесь на [build.nvidia.com](https://build.nvidia.com/)
+2. Создайте API Key (начинается с `nvapi-`)
+3. Скопируйте в `.env` как `NVIDIA_API_KEY`
 
-Endpoint Token Plan (OpenAI-совместимый) уже настроен в коде:
-`https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`
+Endpoint (OpenAI-совместимый) уже настроен в коде:
+`https://integrate.api.nvidia.com/v1`
+
+Если ходите через свой прокси, переопределите базовый адрес переменной `NVIDIA_API_BASE`.
+
+Проверить, какие модели доступны вашему ключу:
+
+```bash
+python list_models.py minimax   # фильтр по подстроке
+python list_models.py --all     # весь каталог
+```
 
 ## Запуск
 
@@ -71,7 +80,7 @@ docker build -t telegram-bot .
 
 ## Структура проекта
 ```
-nvidia_telegram_bot/
+numbertree_bot/
 ├── main.py          # Основной код бота
 ├── roadmap.json     # Каталог языков + готовые шаблоны стеков (редактируйте под себя)
 ├── progress.json    # Настройки стека и прогресс пользователей (создаётся автоматически)
@@ -127,6 +136,6 @@ nvidia_telegram_bot/
 
 - `/interview` (или кнопка в меню) — выбрать категорию, случайный вопрос или все вопросы вперемешку
 - Тест (`mc`) — запускается полл с вариантами; после выбора приходит счёт и объяснение
-- Открытый ответ (`open`) или просто напишите ответ текстом — **LLM оценит ваш вариант по шкале 0-10** и зачтёт его в счёт сессии (балл 7+ = «верно»). Нужен `QWEN_API_KEY`
+- Открытый ответ (`open`) или просто напишите ответ текстом — **LLM оценит ваш вариант по шкале 0-10** и зачтёт его в счёт сессии (балл 7+ = «верно»). Нужен `NVIDIA_API_KEY`
 - При завершении (`🏁 Завершить` или слово «завершить/стоп») бот составляет **резюме собеседования**: итоговый уровень знаний, сильные стороны, что подтянуть и план до middle
 - Счёт сессии и сброс — через кнопку «🏁 Завершить»

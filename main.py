@@ -30,21 +30,24 @@ MAX_HISTORY_PRIVATE = 10   # личка: полная память
 MAX_HISTORY_GROUP = 3      # группы: короткая память на пользователя
 
 # Настройки провайдеров и моделей
+# Эндпоинт можно переопределить через NVIDIA_API_BASE (например, свой прокси в докере).
+NVIDIA_API_BASE = os.getenv("NVIDIA_API_BASE", "https://integrate.api.nvidia.com/v1").rstrip("/")
+
 PROVIDERS = {
-    "qwen": {
-        "name": "Qwen",
-        "api_key": os.getenv("QWEN_API_KEY"),
-        "api_url": "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions",
+    "nvidia": {
+        "name": "NVIDIA",
+        "api_key": os.getenv("NVIDIA_API_KEY"),
+        "api_url": f"{NVIDIA_API_BASE}/chat/completions",
         "models": {
-            "qwen3.6-flash": "qwen3.6-flash",
+            "minimax-m3": "minimaxai/minimax-m3",
         },
-        "default": "qwen3.6-flash",
+        "default": "minimax-m3",
     },
 }
 
 # Пользовательские настройки: chat_id -> {provider, model}
 USER_SETTINGS = {}
-DEFAULT_PROVIDER = "qwen"
+DEFAULT_PROVIDER = "nvidia"
 
 # ============ ROADMAP (конфигурация уровней и стека) ============
 # Читается из roadmap.json рядом с ботом. Содержит:
@@ -1142,8 +1145,11 @@ async def call_provider_api(provider_key: str, model_id: str, messages: list[dic
         "messages": messages,
         "stream": stream,
         "temperature": temperature,
-        "max_tokens": 4096,
+        "max_tokens": 8192,
     }
+    if stream:
+        # NVIDIA присылает usage в стриме только по явному запросу
+        payload["stream_options"] = {"include_usage": True}
     
     async with httpx.AsyncClient(timeout=60.0) as client:
         async with client.stream("POST", api_url, headers=headers, json=payload) as response:
@@ -1157,24 +1163,30 @@ async def call_provider_api(provider_key: str, model_id: str, messages: list[dic
             
             usage = {}
             async for line in response.aiter_lines():
-                if line.startswith("data: "):
-                    data = line[6:]
-                    if data == "[DONE]":
-                        return
-                    try:
-                        import json
-                        chunk = json.loads(data)
-                        choices = chunk.get("choices", [])
-                        if not choices:
-                            continue
-                        delta = choices[0].get("delta", {})
-                        content = delta.get("content", "")
-                        if "usage" in chunk:
-                            usage = chunk["usage"]
-                        if content:
-                            yield content, usage
-                    except json.JSONDecodeError:
-                        continue
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+
+                # Финальный чанк с usage приходит с пустым choices — читаем его до проверки
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                content = choices[0].get("delta", {}).get("content", "")
+                if content:
+                    yield content, usage
+
+            # usage приезжает после последнего текстового чанка, поэтому отдаём его отдельно
+            if usage:
+                yield "", usage
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1198,7 +1210,7 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 continue  # Не приветствуем самого бота
             await update.message.reply_text(
                 f"{emoji('rocket')} <b>Привет, {member.mention_html()}!</b>\n\n"
-                f"{emoji('brain')} Я ИИ-ассистент на базе Qwen 3.6 Flash.\n"
+                f"{emoji('brain')} Я ИИ-ассистент на базе MiniMax M3 (NVIDIA API).\n"
                 f"{emoji('gear')} Отвечаю по @numbertree_bot или reply.\n\n"
                 f"Выберите модель и провайдера:",
                 parse_mode=ParseMode.HTML,
