@@ -418,6 +418,7 @@ async def _interview_start(chat_id: int, category: str):
                 poll_kwargs["explanation"] = expl
             sent = await bot.send_poll(**poll_kwargs)
             INTERVIEW_QUIZ[sent.poll.id] = {"chat_id": chat_id, "correct": correct}
+            sess["awaiting_answer"] = False  # ответ придёт поллом, не текстом
             from telegram import InlineKeyboardButton, InlineKeyboardMarkup
             nav = InlineKeyboardMarkup([
                 [InlineKeyboardButton("⏭️ Следующий вопрос", callback_data="intv:next")],
@@ -431,7 +432,8 @@ async def _interview_start(chat_id: int, category: str):
             )
             return
         # fallback: MC без валидных вариантов -> открытый
-    # открытый вопрос
+    # открытый вопрос — здесь письменный ответ действительно ожидается
+    sess["awaiting_answer"] = True
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     buttons = [
         [InlineKeyboardButton("👁️ Показать разбор", callback_data="intv:answer")],
@@ -458,6 +460,10 @@ async def _interview_show_answer(chat_id: int):
         await bot.send_message(chat_id, f"{emoji('warning')} Сначала задайте вопрос.", parse_mode=ParseMode.HTML)
         return
     q = qs[idx]
+    if sess:
+        # Разбор показан — письменный ответ на этот вопрос больше не ждём,
+        # иначе следующая реплика пользователя опять уйдёт на оценку.
+        sess["awaiting_answer"] = False
     lines = [f"{emoji('brain')} <b>Разбор</b>\n",
              f"{emoji('question')} {md_to_html(q.get('q',''))}"]
     if q.get("type") == "mc" and q.get("options"):
@@ -610,40 +616,66 @@ def _extract_grade(text: str) -> int:
     return None
 
 
+# Команды интервью распознаются ТОЛЬКО целиком. Раньше искали подстрокой, и это
+# ловило «дал» внутри «удали», «след» внутри «проследи», «ответ» внутри «ответь» —
+# обычные просьбы к боту улетали в собеседование.
+INTERVIEW_COMMANDS = {
+    "explain": {"объясни", "объяснение", "разбор", "покажи ответ", "правильный ответ", "открой ответ"},
+    "next": {"дальше", "следующий", "следующий вопрос", "след вопрос", "вперёд"},
+    "finish": {"завершить", "закончить", "завершаем", "конец", "стоп", "закрыть",
+               "завершить собеседование"},
+}
+
+
+def _parse_interview_command(text: str) -> str | None:
+    """Возвращает 'explain' / 'next' / 'finish', если реплика целиком является командой.
+
+    Свободный текст командой не считается: «объясни, как работает GC» — это вопрос
+    к боту, а не просьба показать разбор вопроса собеседования.
+    """
+    normalized = " ".join((text or "").lower().split()).strip(" .,!?…:;")
+    if not normalized:
+        return None
+    for action, words in INTERVIEW_COMMANDS.items():
+        if normalized in words:
+            return action
+    return None
+
+
 async def _handle_interview_text(update: Update) -> bool:
     """Перехватывает текстовые реплики во время интервью.
-    Поддерживает: «объясни/разбор/покажи ответ», «дальше/следующий/следующий вопрос»,
-    «конец/закончить/завершить/стоп». В остальном игнорирует поле (не поедает обычный чат).
+
+    Возвращает True, только если реплика действительно относится к собеседованию:
+    либо это команда целиком, либо ответ на заданный открытый вопрос. Всё
+    остальное отдаём обычному чату.
     """
-    text = (update.message.text or "").strip().lower()
+    text = (update.message.text or "").strip()
     chat_id = update.effective_chat.id
     if not text:
         return False
 
-    words = text.replace("!", " ").replace("?", " ").strip()
-    explain_kw = ("объясни", "разбор", "покажи ответ", "правильный ответ", "объяснение", "почему", "ответ", "открой")
-    next_kw = ("дальше", "следующий", "след", "вперёд", "следующий вопрос", "след вопрос", "дал")
-    finish_kw = ("завершить", "закончить", "завершаем", "конец", "стоп", "завершить собеседование", "закрыть")
-
-    if any(k in words for k in explain_kw):
+    action = _parse_interview_command(text)
+    if action == "explain":
         await _interview_show_answer(chat_id)
         return True
-    if any(k in words for k in next_kw):
+    if action == "next":
         await _interview_next(chat_id, None)
         return True
-    if any(k in words for k in finish_kw):
+    if action == "finish":
         _interview_finish(chat_id)
         msg = await _interview_finish_full(chat_id)
         await _interview_reply_finish(update, msg, chat_id)
         return True
 
-    # Остальное: считаем реплику письменным ответом и оцениваем через LLM
+    # Свободный текст засчитываем как письменный ответ, только если бот его ждёт:
+    # флаг ставится при выдаче открытого вопроса и снимается сразу после оценки.
     sess = INTERVIEW_SESSIONS.get(chat_id)
-    if sess:
+    if sess and sess.get("awaiting_answer"):
         qs = _interview_indexed()
         idx = sess.get("last_idx", -1)
         if 0 <= idx < len(qs):
             q = qs[idx]
+            sess["awaiting_answer"] = False
             await update.message.reply_text(f"{emoji('thinking')} <b>Оцениваю ваш ответ...</b>", parse_mode=ParseMode.HTML)
             try:
                 grade_text = await _interview_grade(chat_id, q, update.message.text)
