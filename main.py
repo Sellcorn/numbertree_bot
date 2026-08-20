@@ -11,6 +11,7 @@ import httpx
 import markdown
 
 import research
+import telegraph
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, PollAnswerHandler, filters, ContextTypes, ChatMemberHandler
@@ -2541,49 +2542,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Финальный ответ. Длинный текст режем на несколько сообщений: у Telegram
     # лимит 4096 символов, и при превышении он отвергает сообщение целиком.
-    # Размер куска подбираем по факту: md_to_html раздувает текст тегами
-    # неравномерно (жирный текст — сильнее всего), и фиксированный лимит
-    # на насыщенной разметке всё равно вылезал бы за 4096.
-    reserve = TELEGRAM_LIMIT - 500  # запас на заголовок, источники и счётчик токенов
-    limit = SAFE_CHUNK
-    while True:
-        chunks = split_markdown(full_text, limit) or [""]
-        if limit <= 800 or all(len(md_to_html(c)) <= reserve for c in chunks):
-            break
-        limit = int(limit * 0.75)
-
+    # Ответ всегда одним сообщением. Если текст не влезает в лимит Telegram,
+    # полная версия публикуется на telegra.ph: её ссылка раскрывается в клиенте
+    # окном Instant View, а в чате остаётся начало ответа.
     header = f"{emoji('brain')} <b>Ответ</b> <i>({elapsed}с)</i>\n\n"
     footer = f"{sources_block}{token_info}"
+    body_html = md_to_html(full_text)
+    page_url = None
 
-    async def deliver(text: str, first: bool):
-        """Отправляет часть ответа; при сбое HTML повторяет обычным текстом."""
+    if len(header) + len(body_html) + len(footer) <= TELEGRAM_LIMIT:
+        final_text = header + body_html + footer
+    else:
+        page_url = await telegraph.publish(user_text[:200] or "Ответ", full_text)
+        if page_url:
+            link = (f'\n\n📖 <a href="{page_url}">Читать полностью '
+                    f'({len(full_text)} символов)</a>')
+        else:
+            link = "\n\n<i>Полную версию опубликовать не удалось, показана только часть.</i>"
+
+        # Подбираем самый длинный кусок начала, который влезает вместе с обвесом.
+        room = TELEGRAM_LIMIT - len(header) - len(footer) - len(link) - 40
+        limit, visible_html = SAFE_CHUNK, ""
+        while limit >= 400:
+            first = (split_markdown(full_text, limit) or [""])[0]
+            candidate = md_to_html(first)
+            if len(candidate) <= room:
+                visible_html = candidate
+                break
+            limit = int(limit * 0.75)
+        final_text = header + visible_html + "\n\n…" + link + footer
+
+    try:
+        await thinking_msg.edit_text(
+            final_text,
+            parse_mode=ParseMode.HTML,
+            # Превью нужно ровно для ссылки на Telegraph — она даёт кнопку
+            # Instant View. В остальных случаях оно только мусорит.
+            disable_web_page_preview=not page_url,
+        )
+    except Exception as e:
+        logger.warning(f"Ответ не ушёл как HTML ({e}), повторяю обычным текстом")
+        plain = re.sub(r"<[^>]+>", "", final_text)[:TELEGRAM_LIMIT]
         try:
-            if first:
-                await thinking_msg.edit_text(text, parse_mode=ParseMode.HTML,
-                                             disable_web_page_preview=True)
-            else:
-                await update.message.reply_text(text, parse_mode=ParseMode.HTML,
-                                                disable_web_page_preview=True)
-            return
-        except Exception as e:
-            logger.warning(f"Часть ответа не ушла как HTML ({e}), повторяю текстом")
+            await thinking_msg.edit_text(plain)
+        except Exception as e2:
+            logger.error(f"Ответ не доставлен: {e2}")
 
-        plain = re.sub(r"<[^>]+>", "", text)[:TELEGRAM_LIMIT]
-        try:
-            if first:
-                await thinking_msg.edit_text(plain)
-            else:
-                await update.message.reply_text(plain)
-        except Exception as e:
-            logger.error(f"Часть ответа не доставлена: {e}")
 
-    for i, chunk in enumerate(chunks):
-        body = md_to_html(chunk)
-        if i == 0:
-            body = header + body
-        if i == len(chunks) - 1:
-            body += footer
-        await deliver(body, first=(i == 0))
 
 
 
