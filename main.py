@@ -69,7 +69,12 @@ DEFAULT_PROVIDER = "nvidia"
 # Пользователь выбирает шаблон или собирает свой стек из языков — это определяет
 # активный список уровней (active_levels). Настройки и прогресс хранятся в progress.json.
 ROADMAP_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "roadmap.json")
-PROGRESS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "progress.json")
+# progress.json — единственный файл, который бот ПИШЕТ. На Railway файловая
+# система контейнера эфемерная, поэтому в проде его нужно класть на volume:
+# смонтируйте том (например в /data) и задайте DATA_DIR=/data. Монтировать том
+# в /app нельзя — он перекроет код бота.
+DATA_DIR = os.getenv("DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
+PROGRESS_PATH = os.path.join(DATA_DIR, "progress.json")
 DEFAULT_ROADMAP = {
     "title": "Путь разработчика",
     "description": "Базовый конфиг. Отредактируйте roadmap.json.",
@@ -134,6 +139,7 @@ async def _save_user_config():
     async with PROGRESS_LOCK:
         tmp = PROGRESS_PATH + ".tmp"
         try:
+            os.makedirs(os.path.dirname(tmp) or ".", exist_ok=True)
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(USER_CONFIG, f, ensure_ascii=False, indent=2)
             os.replace(tmp, PROGRESS_PATH)
