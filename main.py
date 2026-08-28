@@ -1395,6 +1395,7 @@ async def _stream_model(provider_key: str, model_id: str, messages: list[dict], 
         # NVIDIA присылает usage в стриме только по явному запросу
         payload["stream_options"] = {"include_usage": True}
     
+    API_REQUESTS["n"] += 1
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream("POST", api_url, headers=headers, json=payload) as response:
             if response.status_code in (429, 529, 503):
@@ -1508,6 +1509,7 @@ async def _call_model_once(provider_key: str, model_id: str, messages: list[dict
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+    API_REQUESTS["n"] += 1
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(provider["api_url"], headers=headers, json=payload)
         if response.status_code != 200:
@@ -1539,10 +1541,33 @@ def _now() -> float:
     return asyncio.get_event_loop().time()
 
 
+# Бесплатный тариф NVIDIA NIM — ~40 запросов в минуту НА АККАУНТ, а не на модель.
+# Один детальный вопрос стоит до восьми обращений, повторы и запасные модели
+# тратят ту же квоту. Считаем каждый реальный HTTP-запрос, чтобы упор в лимит
+# было видно в логах. Счётчик сквозной: при параллельных сообщениях в дельту
+# одного попадут запросы соседнего — для диагностики это допустимо.
+API_REQUESTS = {"n": 0}
+
+
 def _fallback_models(provider_key: str, model_id: str) -> list[str]:
     """Текущая модель, затем несколько запасных из меню того же провайдера."""
     others = [m for m in PROVIDERS[provider_key]["models"].values() if m != model_id]
     return [model_id] + others[:MAX_FALLBACKS]
+
+
+def _is_rate_limit(error: Exception) -> bool:
+    return isinstance(error, httpx.HTTPStatusError) and error.response.status_code == 429
+
+
+def _retry_after(error: Exception) -> float | None:
+    """Сколько провайдер просит подождать. Свои паузы тут гадать не надо."""
+    if not isinstance(error, httpx.HTTPStatusError):
+        return None
+    raw = error.response.headers.get("retry-after")
+    try:
+        return max(0.0, float(raw)) if raw else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _is_retryable(error: Exception) -> bool:
@@ -1583,13 +1608,25 @@ async def call_provider_api(provider_key: str, model_id: str, messages: list[dic
                 if started:
                     raise  # поток уже пошёл, молча менять модель нельзя
                 last_error = e
+                if _is_rate_limit(e):
+                    # Лимит бесплатного NIM — ~40 запросов в минуту НА АККАУНТ.
+                    # Запасная модель тратит ту же квоту, поэтому перебирать
+                    # модели бессмысленно: только глубже загоняем себя в отказ.
+                    logger.warning(
+                        f"{candidate}: упёрлись в лимит запросов провайдера (429). "
+                        f"Бесплатный тариф NVIDIA NIM — около 40 запросов в минуту "
+                        f"на аккаунт, общих для всех моделей."
+                    )
                 if _is_retryable(e) and attempt < len(RETRY_DELAYS):
-                    # Пауза тоже тратит бюджет: без этой проверки шестисекундное
-                    # ожидание перед последним повтором перепрыгивало дедлайн.
-                    pause = min(RETRY_DELAYS[attempt], max(0.0, deadline - _now()))
+                    # Провайдер сам говорит, сколько ждать; свои паузы — запасной вариант.
+                    asked = _retry_after(e)
+                    pause = min(asked if asked is not None else RETRY_DELAYS[attempt],
+                                max(0.0, deadline - _now()))
                     logger.warning(f"{candidate}: {e}; повтор через {pause:.0f}с")
                     await asyncio.sleep(pause)
                     continue
+                if _is_rate_limit(e):
+                    raise  # перебирать модели на общей квоте незачем
                 break
         logger.warning(f"Модель {candidate} не ответила, пробую запасную")
     raise last_error or RuntimeError("Ни одна модель не ответила")
@@ -1613,13 +1650,25 @@ async def call_provider_api_once(provider_key: str, model_id: str, messages: lis
                                               timeout=min(ROUTE_TIMEOUT, remaining))
             except httpx.HTTPError as e:
                 last_error = e
+                if _is_rate_limit(e):
+                    # Лимит бесплатного NIM — ~40 запросов в минуту НА АККАУНТ.
+                    # Запасная модель тратит ту же квоту, поэтому перебирать
+                    # модели бессмысленно: только глубже загоняем себя в отказ.
+                    logger.warning(
+                        f"{candidate}: упёрлись в лимит запросов провайдера (429). "
+                        f"Бесплатный тариф NVIDIA NIM — около 40 запросов в минуту "
+                        f"на аккаунт, общих для всех моделей."
+                    )
                 if _is_retryable(e) and attempt < len(RETRY_DELAYS):
-                    # Пауза тоже тратит бюджет: без этой проверки шестисекундное
-                    # ожидание перед последним повтором перепрыгивало дедлайн.
-                    pause = min(RETRY_DELAYS[attempt], max(0.0, deadline - _now()))
+                    # Провайдер сам говорит, сколько ждать; свои паузы — запасной вариант.
+                    asked = _retry_after(e)
+                    pause = min(asked if asked is not None else RETRY_DELAYS[attempt],
+                                max(0.0, deadline - _now()))
                     logger.warning(f"{candidate}: {e}; повтор через {pause:.0f}с")
                     await asyncio.sleep(pause)
                     continue
+                if _is_rate_limit(e):
+                    raise  # перебирать модели на общей квоте незачем
                 break
         logger.warning(f"Модель {candidate} не ответила, пробую запасную")
     raise last_error or RuntimeError("Ни одна модель не ответила")
@@ -2677,6 +2726,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         messages.append({"role": "assistant", "content": h["assistant"]})
     messages.append({"role": "user", "content": f"Сегодня {datetime.now().strftime('%d.%m.%Y')}. На вопросы по теории, коду, математике и общим знаниям отвечай сам, без поиска. В интернет иди только если ответ зависит от текущего момента — новости, цены, последние версии, даты; тогда опирайся на найденное, а не на память. ТЫ ОБЯЗАН ОТВЕЧАТЬ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ. ЗАПРЕЩЕНО ИСПОЛЬЗОВАТЬ HTML-ТЕГИ (<hr>, <strong>, <b>, <ol>, <ul>, <li>, <h1>, <h2>, <h3>, <p>, <div>, <span> И ДРУГИЕ). ИСПОЛЬЗУЙ ТОЛЬКО MARKDOWN: **жирный**, *курсив*, `код`, ```блоки кода```, - списки, 1. нумерованные списки, > цитаты. ОТВЕЧАЙ СРАЗУ И ЧЁТКО, БЕЗ РАССУЖДЕНИЙ. СТРУКТУРИРУЙ ОТВЕТ: короткое вступление, затем разделы/списки/код. ЕСЛИ ЗАДАЛИ ВОПРОС (о викторине, коде или чём угодно) — ОТВЕЧАЙ ПРЯМО НА НЕГО. ВОПРОС: {user_text}"})
 
+    calls_at_start = API_REQUESTS["n"]
     all_parts = []
     first_token_at = None   # время до первого видимого токена — главная метрика
     last_edit_len = 0
@@ -2861,11 +2911,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _total = _now() - start_time
     _ttft = first_token_at if first_token_at is not None else _total
     _out = usage.get("completion_tokens") or 0
-    _gen = max(_total - _ttft, 0.001)
+    # У рассуждающей модели completion_tokens включает токены размышлений, а они
+    # приходят в reasoning_content и в ответ не попадают. Делить их на время
+    # одной лишь видимой генерации нельзя — так скорость завышается в разы.
+    _think = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+    _rate = _out / max(_total, 0.001)
     logger.info(
         f"[{model_id}] всего {_total:.1f}с | до первого токена {_ttft:.1f}с | "
-        f"генерация {_gen:.1f}с | промпт-ток. {usage.get('prompt_tokens', 0)} | "
-        f"ответ-ток. {_out} ({_out / _gen:.1f} ток/с) | символов {len(full_text)}"
+        f"промпт-ток. {usage.get('prompt_tokens', 0)} | ответ-ток. {_out}"
+        + (f" (из них размышлений {_think})" if _think is not None else "")
+        + f" | {_rate:.1f} ток/с за всё время | символов {len(full_text)}"
+        + f" | HTTP-запросов к модели: {API_REQUESTS['n'] - calls_at_start}"
     )
     # Маркеры [imgN] нужны только странице Telegraph — там они станут
     # картинками. В сообщении и в истории диалога они лишний шум.
