@@ -2678,6 +2678,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     messages.append({"role": "user", "content": f"Сегодня {datetime.now().strftime('%d.%m.%Y')}. На вопросы по теории, коду, математике и общим знаниям отвечай сам, без поиска. В интернет иди только если ответ зависит от текущего момента — новости, цены, последние версии, даты; тогда опирайся на найденное, а не на память. ТЫ ОБЯЗАН ОТВЕЧАТЬ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ. ЗАПРЕЩЕНО ИСПОЛЬЗОВАТЬ HTML-ТЕГИ (<hr>, <strong>, <b>, <ol>, <ul>, <li>, <h1>, <h2>, <h3>, <p>, <div>, <span> И ДРУГИЕ). ИСПОЛЬЗУЙ ТОЛЬКО MARKDOWN: **жирный**, *курсив*, `код`, ```блоки кода```, - списки, 1. нумерованные списки, > цитаты. ОТВЕЧАЙ СРАЗУ И ЧЁТКО, БЕЗ РАССУЖДЕНИЙ. СТРУКТУРИРУЙ ОТВЕТ: короткое вступление, затем разделы/списки/код. ЕСЛИ ЗАДАЛИ ВОПРОС (о викторине, коде или чём угодно) — ОТВЕЧАЙ ПРЯМО НА НЕГО. ВОПРОС: {user_text}"})
 
     all_parts = []
+    first_token_at = None   # время до первого видимого токена — главная метрика
     last_edit_len = 0
     start_time = asyncio.get_event_loop().time()
     usage = {}
@@ -2818,6 +2819,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         async for token, u in call_provider_api(provider_key, model_id,
                                                 with_reasoning(messages, model_id, ANSWER_REASONING),
                                                 on_fallback=note_fallback):
+            if token and first_token_at is None:
+                # Рассуждающая модель молчит, пока думает: этот интервал и есть
+                # «бот завис». Отделяем его от скорости самой генерации.
+                first_token_at = _now() - start_time
             all_parts.append(token)
             full_text = "".join(all_parts)
             if u:
@@ -2853,7 +2858,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await timer_task
 
     full_text = "".join(all_parts).strip()
-    logger.info(f"Ответ готов за {_now() - start_time:.1f}с, символов: {len(full_text)}")
+    _total = _now() - start_time
+    _ttft = first_token_at if first_token_at is not None else _total
+    _out = usage.get("completion_tokens") or 0
+    _gen = max(_total - _ttft, 0.001)
+    logger.info(
+        f"[{model_id}] всего {_total:.1f}с | до первого токена {_ttft:.1f}с | "
+        f"генерация {_gen:.1f}с | промпт-ток. {usage.get('prompt_tokens', 0)} | "
+        f"ответ-ток. {_out} ({_out / _gen:.1f} ток/с) | символов {len(full_text)}"
+    )
     # Маркеры [imgN] нужны только странице Telegraph — там они станут
     # картинками. В сообщении и в истории диалога они лишний шум.
     page_text = full_text
