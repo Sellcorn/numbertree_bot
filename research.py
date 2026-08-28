@@ -95,8 +95,8 @@ def domain_of(url: str) -> str:
         return url[:40]
 
 
-async def search(query: str, max_results: int = MAX_RESULTS) -> list[dict]:
-    """Ищет через Tavily. Возвращает [{title, url, content}, ...].
+async def search(query: str, max_results: int = MAX_RESULTS) -> tuple[list[dict], list[dict]]:
+    """Ищет через Tavily. Возвращает ([{title, url, content}, ...], [{url, description}, ...]).
 
     Берём поле `content` — это выжимка по теме, уже очищенная от вёрстки.
     `raw_content` (сырая страница целиком, десятки килобайт) не запрашиваем:

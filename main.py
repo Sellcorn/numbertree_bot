@@ -28,10 +28,31 @@ logger = logging.getLogger(__name__)
 
 BOT_USERNAME = None
 
+# Общий экземпляр Bot. Раньше каждая викторина, экспорт и вопрос собеседования
+# создавали свой Bot(token=...): у каждого свой пул httpx-соединений, который
+# никто не закрывал. При аптайме 16 часов в сутки это течёт.
+BOT = None
+
+
+def _bot():
+    """Экземпляр бота из Application. Ставится в main() до старта polling."""
+    if BOT is None:
+        raise RuntimeError("Bot ещё не инициализирован: main() не отработал")
+    return BOT
+
 # Хранилище контекста диалогов
 CONVERSATION_HISTORY = {}
 MAX_HISTORY_PRIVATE = 10   # личка: полная память
 MAX_HISTORY_GROUP = 3      # группы: короткая память на пользователя
+# Длина истории ограничена на чат, но не по числу чатов: при аптайме 16 часов
+# в сутки словари росли, пока бот не перезапустится. Держим потолок и выбрасываем
+# самые старые ключи (dict сохраняет порядок вставки).
+MAX_TRACKED_CHATS = 500
+
+
+def _trim_store(store: dict, limit: int = MAX_TRACKED_CHATS):
+    while len(store) > limit:
+        store.pop(next(iter(store)))
 
 # Настройки провайдеров и моделей
 # Эндпоинт можно переопределить через NVIDIA_API_BASE (например, свой прокси в докере).
@@ -131,10 +152,6 @@ def _load_user_config():
         logger.error(f"Не удалось загрузить progress.json: {e}")
 
 
-def _load_user_config_sync():
-    _load_user_config()
-
-
 # Загружаем сохранённые настройки при старте (синхронно, до запуска loop)
 _load_user_config()
 
@@ -152,21 +169,38 @@ async def _save_user_config():
             logger.error(f"Не удалось сохранить progress.json: {e}")
 
 
+def _default_settings() -> dict:
+    return {"template": None, "languages": [], "level_index": 0, "done_topics": []}
+
+
 def _get_user_settings(chat_id: int) -> dict:
+    """Настройки чата для ИЗМЕНЕНИЯ: создаёт запись, если её ещё нет."""
     sid = str(chat_id)
     if sid not in USER_CONFIG or not isinstance(USER_CONFIG[sid], dict):
-        USER_CONFIG[sid] = {"template": None, "languages": [], "level_index": 0, "done_topics": []}
+        USER_CONFIG[sid] = _default_settings()
     s = USER_CONFIG[sid]
-    s.setdefault("template", None)
-    s.setdefault("languages", [])
-    s.setdefault("level_index", 0)
-    s.setdefault("done_topics", [])
+    for key, value in _default_settings().items():
+        s.setdefault(key, value)
     return s
 
 
+def _peek_user_settings(chat_id: int) -> dict:
+    """Настройки чата для ЧТЕНИЯ: записи не создаёт.
+
+    Раньше любое чтение (а оно идёт на каждое сообщение) заводило запись в
+    USER_CONFIG, и progress.json пух от чатов, которые ничего не настраивали.
+    """
+    s = USER_CONFIG.get(str(chat_id))
+    if not isinstance(s, dict):
+        return _default_settings()
+    merged = _default_settings()
+    merged.update(s)
+    return merged
+
+
 def get_progress(chat_id: int) -> dict:
-    """Настройки+прогресс пользователя (персистентные)."""
-    return _get_user_settings(chat_id)
+    """Настройки+прогресс пользователя (только чтение)."""
+    return _peek_user_settings(chat_id)
 
 
 # ============ АКТИВНЫЙ СПИСОК УРОВНЕЙ (исходя из выбранного шаблона/языков) ============
@@ -192,7 +226,7 @@ def _template_levels(tpl_id: str) -> list:
 def active_levels(chat_id: int) -> list:
     """Список уровней для пользователя: из выбранного шаблона, либо из его языков.
     Если ничего не выбрано — все уровни всех языков каталога (демо-режим)."""
-    s = _get_user_settings(chat_id)
+    s = _peek_user_settings(chat_id)
     if s.get("template"):
         lvl = _template_levels(s["template"])
         if lvl:
@@ -242,7 +276,9 @@ def level_topics_done(chat_id: int, level_index: int) -> list[str]:
     prog = get_progress(chat_id)
     key = f"lvl{level_index}"
     done_keys = set(prog.get("done_topics", []))
-    return [t for t in tops if f"{key}#{tops.index(t)}" in done_keys]
+    # Позицию берём из enumerate, а не через tops.index(): index() возвращает
+    # первое совпадение, и две одинаковые темы в focus отмечались разом.
+    return [t for i, t in enumerate(tops) if f"{key}#{i}" in done_keys]
 
 
 async def set_user_template(chat_id: int, tpl_id: str):
@@ -344,7 +380,10 @@ def _interview_pick(chat_id: int, category: str | None) -> dict | None:
         s["category"] = category
     if not s.get("ready"):
         # сохраняем глобальные индексы один раз на длительность сессии
-        s["queue"] = [all_qs.index(q) for q in qs]
+        # Индексы берём по позиции, а не через list.index(): одинаковые по
+        # содержимому вопросы иначе схлопываются в один и тот же индекс.
+        chosen = {id(q) for q in qs}
+        s["queue"] = [i for i, q in enumerate(all_qs) if id(q) in chosen]
         random.shuffle(s["queue"])
         s["ready"] = True
     if not s["queue"]:
@@ -400,8 +439,7 @@ async def interview_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _interview_start(chat_id: int, category: str):
     """Запускает/продолжает сессию интервью и выдаёт следующий вопрос в нужном формате."""
-    from telegram import Bot
-    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    bot = _bot()
     q = _interview_pick(chat_id, category or None)
     if not q:
         await bot.send_message(chat_id, f"{emoji('warning')} Вопросы кончились. Начните заново (/interview).", parse_mode=ParseMode.HTML)
@@ -462,9 +500,8 @@ async def _interview_start(chat_id: int, category: str):
 
 async def _interview_show_answer(chat_id: int):
     """Показывает разбор текущего (последнего) вопроса."""
-    from telegram import Bot
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    bot = _bot()
     sess = INTERVIEW_SESSIONS.get(chat_id)
     idx = sess.get("last_idx", -1) if sess else -1
     qs = _interview_indexed()
@@ -509,7 +546,10 @@ def _interview_finish(chat_id: int) -> str:
     score, total = (sess.get("score", 0), sess.get("total", 0)) if sess else (0, 0)
     written = (sess.get("written", []) if sess else []) or []
     INTERVIEW_SESSIONS.pop(chat_id, None)
-    INTERVIEW_QUIZ.clear()
+    # Только свои поллы: clear() гасил маппинг для всех чатов сразу, и ответы
+    # других пользователей переставали засчитываться.
+    for poll_id in [p for p, info in INTERVIEW_QUIZ.items() if info.get("chat_id") == chat_id]:
+        INTERVIEW_QUIZ.pop(poll_id, None)
     msg = (f"{emoji('microphone')} <b>Техсобеседование завершено!</b>\n\n"
            f"📊 Счёт: <b>{score}/{total}</b>\n"
            f"Начать заново — /interview")
@@ -528,8 +568,15 @@ async def _interview_finish_full(chat_id: int) -> str:
         return data.get("msg", f"{emoji('microphone')} Техсобеседование завершено!")
     try:
         provider_key, model_id = get_current_model(chat_id)
-        items = "\n".join(f"- {w.get('q')} — {w.get('score')}/10" for w in written)
-        avg = round(sum((w.get('score') or 0) for w in written) / max(len(written), 1), 1)
+        # Ответы без распознанного балла в среднее не берём, иначе они тянут
+        # оценку вниз так, будто кандидат ответил на ноль.
+        graded = [w for w in written if isinstance(w.get("score"), int)]
+        items = "\n".join(
+            f"- {w.get('q')} — {w['score']}/10" if isinstance(w.get("score"), int)
+            else f"- {w.get('q')} — балл не определён"
+            for w in written
+        )
+        avg = round(sum(w["score"] for w in graded) / max(len(graded), 1), 1)
         prompt = (
             "Ты — карьерный консультант и техлид по Go. Кандидат только что прошёл собеседование, "
             "где письменно отвечал на вопросы. По оценкам вопросов сделай вывод об уровне знаний и "
@@ -564,9 +611,8 @@ async def _interview_poll_result(update: Update, iinfo: dict):
         verdict = f"{emoji('check')} <b>Верно!</b>"
     else:
         verdict = f"{emoji('warning')} <b>Неверно.</b> Правильный — вариант {correct+1}."
-    from telegram import Bot
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    bot = _bot()
     buttons = [[InlineKeyboardButton("⏭️ Следующий вопрос", callback_data="intv:next")],
                [InlineKeyboardButton("🏁 Завершить", callback_data="intv:finish")]]
     await bot.send_message(
@@ -608,17 +654,19 @@ async def _interview_grade(chat_id: int, question: dict, answer: str) -> str:
     score = _extract_grade(text)
     sess.setdefault("written", []).append({"q": question_text, "score": score})
     sess["total"] += 1
-    if score >= 7:
+    # Балла может не быть: модель не всегда пишет «Оценка: X/10». Тогда разбор
+    # показываем, но в счёт не берём — сравнивать None с числом нельзя.
+    if score is not None and score >= 7:
         sess["score"] += 1
 
+    grade_line = f"<b>{score}/10</b>" if score is not None else "<i>не распознан</i>"
     header = (f"{emoji('brain')} <b>Оценка вашего ответа</b>\n"
-              f"{emoji('spark')} Балл: <b>{score}/10</b> · Счёт сессии: <b>{sess['score']}/{sess['total']}</b>\n\n")
+              f"{emoji('spark')} Балл: {grade_line} · Счёт сессии: <b>{sess['score']}/{sess['total']}</b>\n\n")
     return header + md_to_html(text)
 
 
-def _extract_grade(text: str) -> int:
+def _extract_grade(text: str) -> int | None:
     """Достаёт число из 'Оценка: X/10' (или 'X/10'), иначе возвращает None."""
-    import re
     m = re.search(r"(\d{1,2})\s*/\s*10", text)
     if m:
         try:
@@ -821,28 +869,40 @@ CUSTOM_EMOJI = {
 }
 
 # Fallback на обычные эмодзи если custom_id не заданы
+FALLBACK_EMOJI = {
+    "thinking": "🤔",
+    "spark": "✨",
+    "brain": "🧠",
+    "gear": "⚙️",
+    "rocket": "🚀",
+    "check": "✅",
+    "answer": "💬",
+    "code": "💻",
+    "warning": "⚠️",
+    "error": "❌",
+    "target": "🎯",
+    "microphone": "🎙️",
+    "arrow": "➡️",
+    "pencil": "✍️",
+    "question": "❓",
+    "eye": "👁",
+    "like": "👍",
+}
+
+# Премиальные эмодзи <tg-emoji> доступны не каждому боту (нужно доп. имя,
+# купленное на Fragment). Если Telegram их отвергает, вся разметка сообщения
+# не парсится — тогда выключите их переменной CUSTOM_EMOJI=0.
+CUSTOM_EMOJI_ENABLED = os.getenv("CUSTOM_EMOJI", "1").strip().lower() not in ("0", "false", "no")
+
+
 def emoji(key: str) -> str:
-    fallback = {
-        "thinking": "🤔",
-        "spark": "✨",
-        "brain": "🧠",
-        "gear": "⚙️",
-        "rocket": "🚀",
-        "check": "✅",
-        "answer": "💬",
-        "code": "💻",
-        "warning": "⚠️",
-        "error": "❌",
-        "target": "🎯",
-        "microphone": "🎙️",
-        "arrow": "➡️",
-        "pencil": "✍️",
-        "question": "❓",
-    }
+    # Ключей без fallback быть не должно: раньше eye/like были только в
+    # CUSTOM_EMOJI, и обращение к ним уронило бы хендлер с KeyError.
+    plain = FALLBACK_EMOJI.get(key, "")
     custom_id = CUSTOM_EMOJI.get(key)
-    if custom_id:
-        return f'<tg-emoji emoji-id="{custom_id}">{fallback[key]}</tg-emoji>'
-    return fallback[key]
+    if custom_id and CUSTOM_EMOJI_ENABLED and plain:
+        return f'<tg-emoji emoji-id="{custom_id}">{plain}</tg-emoji>'
+    return plain
 
 
 # HTML-теги, которые поддерживает Telegram (см. Bot API, раздел «HTML style»).
@@ -853,6 +913,11 @@ _TG_TAGS = ("b", "strong", "i", "em", "u", "ins", "s", "strike", "del",
 
 _TABLE_ROW_RE = re.compile(r'^\s*\|?(?:\s*[^|]+\s*\|\s*)+\s*\|?\s*$')
 _TABLE_SEP_RE = re.compile(r'^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$')
+
+# Ограждённый блок кода целиком: открывающие ``` обязаны стоять в начале строки.
+# Ячейку таблицы это не заденет — там ``` идёт после «| », а не с начала строки,
+# и разбирает её tables.split_cell.
+_FENCE_BLOCK_RE = re.compile(r'(?ms)^[ \t]{0,3}```[^\n]*\n.*?^[ \t]{0,3}```[ \t]*$')
 
 
 def _convert_table_blocks(text: str) -> str:
@@ -888,9 +953,21 @@ def md_to_html(text: str) -> str:
         return ""
     # <br> модели ставят внутри ячеек таблиц — без этого слова склеятся
     text = re.sub(r'<br\s*/?>', ' ', text, flags=re.I)
-    # СНАЧАЛА удаляем ВСЕ HTML-теги (модели часто выдают HTML вместо markdown)
-    text = re.sub(r'<[^>]+>', '', text)
-    # Markdown-таблицы --> в <pre> (Telegram не умеет <table>)
+    # Блоки кода прячем ДО чистки тегов: иначе `std::vector<int>` теряет <int>,
+    # а `# комментарий` внутри ```bash``` уезжает в заголовок. Возвращаем их
+    # перед markdown-конвертером, чтобы fenced_code сам экранировал < и >.
+    code_blocks = []
+
+    def _stash_code(match):
+        code_blocks.append(match.group(0))
+        return f"zqCODEBLOCK{len(code_blocks) - 1}qz"
+
+    text = _FENCE_BLOCK_RE.sub(_stash_code, text)
+    # Удаляем HTML-теги (модели часто выдают HTML вместо markdown), но
+    # НЕ трогаем однострочный `код`: там угловые скобки — часть кода.
+    text = re.sub(r'(`[^`\n]+`)|<[^>]+>', lambda m: m.group(1) or '', text)
+    # Markdown-таблицы --> в <pre> (Telegram не умеет <table>). Ограждённые
+    # блоки уже спрятаны, а код внутри ячеек tables.py разбирает сам.
     text = _convert_table_blocks(text)
     # Готовые <pre> прячем от дальнейшей обработки: и markdown-конвертер, и
     # финальная чистка пробелов срезают отступы в начале строк, а на них
@@ -906,6 +983,10 @@ def md_to_html(text: str) -> str:
     text = re.sub(r'(?m)^(#{1,6})\s+(.+)$', lambda m: f"<b>{m.group(2)}</b>", text)
     # HR --> разделитель
     text = re.sub(r'(?m)^\s*(---+|\*\*\*+)\s*$', '────────────────', text)
+    # Блоки кода возвращаем до конвертации: fenced_code превратит их в
+    # <pre><code> и заэкранирует угловые скобки внутри.
+    for index, block in enumerate(code_blocks):
+        text = text.replace(f"zqCODEBLOCK{index}qz", block)
     md = markdown.Markdown(
         extensions=["fenced_code", "tables", "nl2br", "sane_lists"],
         output_format="html",
@@ -913,6 +994,10 @@ def md_to_html(text: str) -> str:
     html = md.convert(text)
     html = re.sub(r'<pre><code class="language-(\w+)">', r'<pre><code>', html)
     html = html.replace('<code class="language-">', '<code>')
+    # <pre> из блоков кода родились только что, во время конвертации. Их тоже
+    # надо спрятать: финальная чистка переносов срезает отступы в начале
+    # строк, а на них держится любой код сложнее одной строки.
+    html = re.sub(r'<pre>.*?</pre>', _stash, html, flags=re.S)
     html = re.sub(r'<p>', '', html)
     html = html.replace('</p>', '\n')
     # ul/ol/li --> списки простым текстом (Telegram не поддерживает эти теги)
@@ -963,7 +1048,7 @@ def get_user_settings(chat_id: int) -> dict:
     Неизвестные значения (например, провайдер qwen из старых версий или
     модель, убранная из меню) молча заменяются на дефолтные.
     """
-    stored = _get_user_settings(chat_id)
+    stored = _peek_user_settings(chat_id)
     provider = stored.get("provider")
     if provider not in PROVIDERS:
         provider = DEFAULT_PROVIDER
@@ -1113,7 +1198,7 @@ def build_roadmap_menu(chat_id: int):
 def build_stack_menu(chat_id: int):
     """Меню выбора стека: готовый шаблон или свой набор языков."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    s = _get_user_settings(chat_id)
+    s = _peek_user_settings(chat_id)
     cur_template = s.get("template")
     cur_langs = set(s.get("languages", []))
 
@@ -1444,7 +1529,9 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """Приветствует новых участников в группе с кнопками меню."""
     if update.message and update.message.new_chat_members:
         for member in update.message.new_chat_members:
-            if member.id == BOT_USERNAME:
+            # Сравнивать id с username бессмысленно (int против str) — бот
+            # здоровался сам с собой при каждом добавлении в группу.
+            if member.id == context.bot.id:
                 continue  # Не приветствуем самого бота
             await update.message.reply_text(
                 f"{emoji('rocket')} <b>Привет, {member.mention_html()}!</b>\n\n"
@@ -1600,6 +1687,14 @@ async def poll_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _run_poll(update.message.chat_id, context, poll_type)
 
 
+async def task_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Генерирует задачу по программированию: /task [easy|medium|hard|random]"""
+    difficulty = context.args[0] if context.args else "medium"
+    if difficulty not in ("easy", "medium", "hard", "random"):
+        difficulty = "medium"
+    await _run_task(update.message.chat_id, context, difficulty)
+
+
 async def code_help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Помощь с кодом: /code [action] [code] или реплай на сообщение с кодом"""
     if not update.message.text or len(update.message.text.split()) < 2:
@@ -1658,7 +1753,7 @@ async def stack_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await set_user_template(chat_id, payload.split(":", 1)[1])
     elif payload.startswith("lang:"):
         lang_id = payload.split(":", 1)[1]
-        cur = set(_get_user_settings(chat_id).get("languages", []))
+        cur = set(_peek_user_settings(chat_id).get("languages", []))
         await toggle_user_language(chat_id, lang_id, lang_id not in cur)
     elif payload == "none":
         pass
@@ -1771,11 +1866,10 @@ def build_export_with_level(chat_id: int, index: int) -> str:
 async def roadmap_export_level(chat_id: int, index: int):
     """Отправляет уровень как .md файл."""
     from io import BytesIO
-    from telegram import Bot
     md = build_export_with_level(chat_id, index)
     if not md:
         return
-    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    bot = _bot()
     bio = BytesIO(md.encode("utf-8"))
     bio.name = f"level_{index + 1}.md"
     await bot.send_document(chat_id=chat_id, document=bio, caption=f"{emoji('check')} Экспорт уровня {index + 1}")
@@ -1784,11 +1878,10 @@ async def roadmap_export_level(chat_id: int, index: int):
 async def roadmap_export_all(chat_id: int):
     """Отправляет полный roadmap как .md файл."""
     from io import BytesIO
-    from telegram import Bot
     md = build_export_markdown(chat_id)
     if not md:
         return
-    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    bot = _bot()
     bio = BytesIO(md.encode("utf-8"))
     bio.name = "roadmap.md"
     await bot.send_document(chat_id=chat_id, document=bio, caption=f"{emoji('check')} Экспорт всего roadmap (.md)")
@@ -1801,7 +1894,9 @@ def mark_topic_done(chat_id: int, index: int) -> tuple[str, int]:
     if not level:
         return "Уровень не найден", 0
     tops = topics_of(level)
-    prog = get_progress(chat_id)
+    # Здесь прогресс именно МЕНЯЕТСЯ, поэтому берём изменяемую запись, а не
+    # снимок из get_progress — иначе отметка темы никуда не сохранится.
+    prog = _get_user_settings(chat_id)
     done = set(prog.get("done_topics", []))
     key_prefix = f"lvl{index}#"
     next_i = next((i for i, t in enumerate(tops) if f"{key_prefix}{i}" not in done), None)
@@ -1818,8 +1913,7 @@ async def _run_learn(chat_id: int, context: ContextTypes.DEFAULT_TYPE, index: in
     index = normalize_level_index(chat_id, index)
     level = get_level(chat_id, index)
     if not level:
-        from telegram import Bot
-        bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+        bot = _bot()
         await bot.send_message(chat_id, f"{emoji('warning')} Уровень не найден.", parse_mode=ParseMode.HTML)
         return
 
@@ -1838,8 +1932,7 @@ async def _run_learn(chat_id: int, context: ContextTypes.DEFAULT_TYPE, index: in
         f"- Объём ~20-30 строк. Это теория перед тестом — дай самое важное."
     )
 
-    from telegram import Bot
-    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    bot = _bot()
     msg = await bot.send_message(chat_id, f"{emoji('brain')} <b>Готовлю теорию по уровню...</b>", parse_mode=ParseMode.HTML)
 
     try:
@@ -1891,8 +1984,7 @@ async def _poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sess["total"] += 1
         sess["score"] += score
 
-    from telegram import Bot
-    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    bot = _bot()
     if is_right:
         verdict = f"{emoji('check')} <b>Верно!</b>"
     else:
@@ -2017,8 +2109,7 @@ async def _run_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE, topic: str
         f"correct — индекс правильного варианта от 0 до 3."
     )
 
-    from telegram import Bot
-    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    bot = _bot()
     msg = await bot.send_message(chat_id, f"{emoji('brain')} <b>Генерирую викторину...</b>", parse_mode=ParseMode.HTML)
 
     try:
@@ -2038,7 +2129,7 @@ async def _run_quiz(chat_id: int, context: ContextTypes.DEFAULT_TYPE, topic: str
                 poll_kwargs["explanation"] = quiz["explanation"]
             sent = await bot.send_poll(**poll_kwargs)
             if learn_session:
-                sess = LEARN_SESSIONS.get(chat_id)
+                sess = LEARN_SESSIONS.setdefault(chat_id, {"level_index": 0, "theory": ""})
                 sess.setdefault("score", 0)
                 sess.setdefault("total", 0)
                 LEARN_QUIZ[sent.poll.id] = {
@@ -2080,8 +2171,7 @@ async def _run_poll(chat_id: int, context: ContextTypes.DEFAULT_TYPE, poll_type:
         f'{{"question": "текст вопроса", "options": ["вариант 1", "вариант 2", "вариант 3"]}}'
     )
 
-    from telegram import Bot
-    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    bot = _bot()
     msg = await bot.send_message(chat_id, f"{emoji('code')} <b>Создаю опрос...</b>", parse_mode=ParseMode.HTML)
 
     try:
@@ -2127,8 +2217,7 @@ async def _run_code_help(chat_id: int, context: ContextTypes.DEFAULT_TYPE, actio
         f"Ответ на русском, используй markdown для кода."
     )
     
-    from telegram import Bot
-    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    bot = _bot()
     msg = await bot.send_message(chat_id, f"{emoji('code')} <b>Анализирую код...</b>", parse_mode=ParseMode.HTML)
     
     try:
@@ -2187,8 +2276,7 @@ async def _run_task(chat_id: int, context: ContextTypes.DEFAULT_TYPE, difficulty
         f"На русском языке."
     )
     
-    from telegram import Bot
-    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    bot = _bot()
     msg = await bot.send_message(chat_id, f"{emoji('brain')} <b>Генерирую задачу...</b>", parse_mode=ParseMode.HTML)
     
     try:
@@ -2389,9 +2477,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     elif data.startswith("quiz:"):
         topic = data.split(":")[1]
+        # answer() обязан прийти в первые секунды, иначе Telegram гасит запрос
+        # по таймауту и кнопка «залипает». Генерация идёт уже после ответа.
+        await query.answer(f"{FALLBACK_EMOJI['brain']} Генерирую викторину...")
         await _run_quiz(chat_id, context, topic)
     elif data.startswith("poll:"):
         poll_type = data.split(":")[1]
+        await query.answer(f"{FALLBACK_EMOJI['code']} Создаю опрос...")
         await _run_poll(chat_id, context, poll_type)
     elif data.startswith("code:"):
         action = data.split(":")[1]
@@ -2404,6 +2496,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif data.startswith("task:"):
         difficulty = data.split(":")[1]
+        await query.answer(f"{FALLBACK_EMOJI['brain']} Генерирую задачу...")
         await _run_task(chat_id, context, difficulty)
 
 
@@ -2421,6 +2514,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Ограничиваем размер
         if len(CHAT_MESSAGES[chat_id]) > MAX_CHAT_MESSAGES:
             CHAT_MESSAGES[chat_id] = CHAT_MESSAGES[chat_id][-MAX_CHAT_MESSAGES:]
+        _trim_store(CHAT_MESSAGES)
 
     if not should_respond(update):
         return
@@ -2643,6 +2737,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(history) > max_history:
         history.pop(0)
     CONVERSATION_HISTORY[history_key] = history
+    _trim_store(CONVERSATION_HISTORY)
 
     # Информация о токенах
     token_info = ""
@@ -2734,12 +2829,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    global BOT_USERNAME
+    global BOT_USERNAME, BOT
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise ValueError("Установите переменную окружения TELEGRAM_BOT_TOKEN")
 
     app = Application.builder().token(token).build()
+    # Один экземпляр на весь процесс: его жизненным циклом управляет Application.
+    BOT = app.bot
 
     async def post_init(app):
         global BOT_USERNAME
@@ -2757,6 +2854,10 @@ def main():
             BotCommand("stack", "🧰 Выбрать стек и языки"),
             BotCommand("interview", "🎙️ Техсобеседование по Go"),
             BotCommand("learn", "🎓 Режим обучения: теория + тест"),
+            BotCommand("quiz", "🧠 Викторина по теме"),
+            BotCommand("poll", "📊 Умный опрос"),
+            BotCommand("code", "💻 Помощь с кодом"),
+            BotCommand("task", "🎯 Задача по программированию"),
             BotCommand("export", "📤 Экспорт tasks/вопросов в .md для Obsidian"),
         ])
 
@@ -2767,11 +2868,13 @@ def main():
     app.add_handler(CommandHandler("context", context_command))
     app.add_handler(CommandHandler("summary", summary_command))
     app.add_handler(CommandHandler("judge", judge_command))
-    # Новые команды для кнопок
-    app.add_handler(CommandHandler("quiz", lambda u, c: quiz_handler(u, c, c.args[0] if c.args else "random")))
-    app.add_handler(CommandHandler("poll", lambda u, c: poll_handler(u, c, c.args[0] if c.args else "opinion")))
-    app.add_handler(CommandHandler("code", lambda u, c: code_help_handler(u, c, c.args[0] if c.args else "explain")))
-    app.add_handler(CommandHandler("task", lambda u, c: task_handler(u, c, c.args[0] if c.args else "medium")))
+    # Новые команды для кнопок. Аргументы хендлеры разбирают сами из
+    # context.args — обёртка-лямбда передавала лишний третий параметр и
+    # роняла команду с TypeError ещё до первой строки тела.
+    app.add_handler(CommandHandler("quiz", quiz_handler))
+    app.add_handler(CommandHandler("poll", poll_handler))
+    app.add_handler(CommandHandler("code", code_help_handler))
+    app.add_handler(CommandHandler("task", task_handler))
     app.add_handler(CommandHandler("roadmap", roadmap_command))
     app.add_handler(CommandHandler("stack", stack_command))
     app.add_handler(CommandHandler("interview", interview_command))
@@ -2782,13 +2885,10 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
 
-    import asyncio
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-    loop.run_until_complete(app.run_polling())
+    # run_polling в PTB 21 — синхронный метод, он сам поднимает и закрывает
+    # event loop. Оборачивать его в run_until_complete не нужно: при остановке
+    # бота туда прилетал None и всё падало с TypeError.
+    app.run_polling()
 
 
 if __name__ == "__main__":
