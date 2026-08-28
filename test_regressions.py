@@ -166,7 +166,60 @@ check("с сессией интервью активно", main._is_interview_ac
 main.INTERVIEW_SESSIONS.clear()
 
 
-total = 26
+# ---------- потолок на время одного запроса ----------
+# Регрессия: повторы перемножались (3 попытки x 3 модели = 9 обращений), и при
+# молчащей модели пользователь ждал больше 1000с вместо ответа или ошибки.
+import asyncio
+import httpx
+
+
+async def _deadline_probe():
+    fake, budget = 3.0, 8.0
+    saved = (main._stream_model, main._call_model_once, main.TOTAL_DEADLINE)
+    main.TOTAL_DEADLINE = budget
+
+    async def dead_stream(p, m, msgs, stream=True, temperature=0.6, timeout=None):
+        assert timeout is not None, "таймаут обязан прокидываться в попытку"
+        await asyncio.sleep(min(fake, timeout))
+        raise httpx.ReadTimeout("модель молчит")
+        yield  # pragma: no cover
+
+    async def dead_once(p, m, msgs, tools=None, temperature=0.3, timeout=None):
+        assert timeout is not None, "таймаут обязан прокидываться в попытку"
+        await asyncio.sleep(min(fake, timeout))
+        raise httpx.ReadTimeout("модель молчит")
+
+    main._stream_model, main._call_model_once = dead_stream, dead_once
+    loop = asyncio.get_event_loop()
+    try:
+        t0 = loop.time()
+        try:
+            async for _ in main.call_provider_api("nvidia", "meta/muse-glimmer-30b", []):
+                pass
+        except Exception:
+            pass
+        stream_took = loop.time() - t0
+
+        t0 = loop.time()
+        try:
+            await main.call_provider_api_once("nvidia", "meta/muse-glimmer-30b", [])
+        except Exception:
+            pass
+        once_took = loop.time() - t0
+    finally:
+        main._stream_model, main._call_model_once, main.TOTAL_DEADLINE = saved
+    return stream_took, once_took, budget
+
+
+_stream_took, _once_took, _budget = asyncio.run(_deadline_probe())
+check_true(f"стриминг уложился в бюджет ({_stream_took:.1f}s <= {_budget}s)",
+           _stream_took <= _budget + 1, f"{_stream_took:.1f}s")
+check_true(f"маршрутный вызов уложился в бюджет ({_once_took:.1f}s <= {_budget}s)",
+           _once_took <= _budget + 1, f"{_once_took:.1f}s")
+check_true("бюджет поиска задан", main.RESEARCH_BUDGET > 0)
+
+
+total = 29
 if failures:
     print(f"ПРОВАЛЕНО {len(failures)}:")
     print("\n".join(failures))

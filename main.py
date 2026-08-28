@@ -1063,7 +1063,8 @@ SMALL_TALK = {
     "поняла", "ясно", "хорошо", "отлично", "супер", "круто", "класс",
     # болтовня и проверка связи
     "как дела", "как ты", "как жизнь", "чем занимаешься", "how are you",
-    "тест", "test", "проверка", "ты тут", "ты здесь",
+    "тест", "test", "проверка", "ты тут", "ты здесь", "ау", "алло", "эй",
+    "работаешь", "ты жив", "живой",
 }
 
 
@@ -1368,7 +1369,8 @@ def build_roadmap_level_text(chat_id: int, index: int) -> str:
     return "\n".join(lines)
 
 
-async def _stream_model(provider_key: str, model_id: str, messages: list[dict], stream: bool = True, temperature: float = 0.6) -> AsyncGenerator[tuple[str, dict], None]:
+async def _stream_model(provider_key: str, model_id: str, messages: list[dict], stream: bool = True,
+                        temperature: float = 0.6, timeout: float = 150.0) -> AsyncGenerator[tuple[str, dict], None]:
     """Одна попытка стриминга у конкретной модели, без повторов."""
     provider = PROVIDERS[provider_key]
     api_key = provider["api_key"]
@@ -1393,7 +1395,7 @@ async def _stream_model(provider_key: str, model_id: str, messages: list[dict], 
         # NVIDIA присылает usage в стриме только по явному запросу
         payload["stream_options"] = {"include_usage": True}
     
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream("POST", api_url, headers=headers, json=payload) as response:
             if response.status_code in (429, 529, 503):
                 raise httpx.HTTPStatusError(f"Rate limited", request=response.request, response=response)
@@ -1480,7 +1482,8 @@ def split_markdown(text: str, limit: int = SAFE_CHUNK) -> list[str]:
 
 async def _call_model_once(provider_key: str, model_id: str, messages: list[dict],
                            tools: list[dict] | None = None,
-                           temperature: float = 0.3) -> dict:
+                           temperature: float = 0.3,
+                           timeout: float = 60.0) -> dict:
     """Нестриминговый вызов: возвращает message целиком, включая tool_calls.
 
     Нужен циклу веб-поиска: там важно увидеть решение модели разом, а склеивать
@@ -1505,7 +1508,7 @@ async def _call_model_once(provider_key: str, model_id: str, messages: list[dict
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(provider["api_url"], headers=headers, json=payload)
         if response.status_code != 200:
             logger.error(f"{provider['name']} API error {response.status_code}: {response.text[:300]}")
@@ -1517,6 +1520,23 @@ async def _call_model_once(provider_key: str, model_id: str, messages: list[dict
 RETRY_STATUSES = (429, 500, 502, 503, 529)
 RETRY_DELAYS = (2, 6)  # паузы перед повторами одной и той же модели, секунды
 MAX_FALLBACKS = 2      # сколько запасных моделей пробовать, чтобы не ждать вечно
+
+# Потолок на ВСЕ попытки одного запроса. Без него повторы перемножались:
+# 3 попытки x 3 модели = 9 обращений, и при таймауте в 60с это больше 1000
+# секунд молчания в чат. Пользователь столько не ждёт, ему нужен ответ или
+# честная ошибка. Таймаут каждой попытки дополнительно урезается остатком
+# бюджета, иначе последняя попытка перепрыгнула бы дедлайн.
+TOTAL_DEADLINE = float(os.getenv("TOTAL_DEADLINE", "180"))
+# Рассуждающая модель молчит, пока думает: до первого видимого токена может
+# пройти сильно больше прежних 60с, и попытка «протухала» на живой модели.
+STREAM_TIMEOUT = float(os.getenv("STREAM_TIMEOUT", "150"))
+ROUTE_TIMEOUT = float(os.getenv("ROUTE_TIMEOUT", "60"))
+# Потолок на весь цикл поиска: кругов до MAX_ROUNDS, у каждого свой дедлайн.
+RESEARCH_BUDGET = float(os.getenv("RESEARCH_BUDGET", "240"))
+
+
+def _now() -> float:
+    return asyncio.get_event_loop().time()
 
 
 def _fallback_models(provider_key: str, model_id: str) -> list[str]:
@@ -1541,12 +1561,18 @@ async def call_provider_api(provider_key: str, model_id: str, messages: list[dic
     печататься, переключаться нельзя — получится склейка двух разных ответов.
     """
     last_error = None
+    deadline = _now() + TOTAL_DEADLINE
     for position, candidate in enumerate(_fallback_models(provider_key, model_id)):
         for attempt in range(len(RETRY_DELAYS) + 1):
+            remaining = deadline - _now()
+            if remaining <= 1:
+                logger.warning(f"Бюджет {TOTAL_DEADLINE:.0f}с исчерпан, попытки прекращены")
+                raise last_error or TimeoutError(f"Модель не ответила за {TOTAL_DEADLINE:.0f}с")
             started = False
             try:
                 async for token, usage in _stream_model(provider_key, candidate, messages,
-                                                        stream=stream, temperature=temperature):
+                                                        stream=stream, temperature=temperature,
+                                                        timeout=min(STREAM_TIMEOUT, remaining)):
                     if not started:
                         started = True
                         if position > 0 and on_fallback:
@@ -1558,8 +1584,11 @@ async def call_provider_api(provider_key: str, model_id: str, messages: list[dic
                     raise  # поток уже пошёл, молча менять модель нельзя
                 last_error = e
                 if _is_retryable(e) and attempt < len(RETRY_DELAYS):
-                    logger.warning(f"{candidate}: {e}; повтор через {RETRY_DELAYS[attempt]}с")
-                    await asyncio.sleep(RETRY_DELAYS[attempt])
+                    # Пауза тоже тратит бюджет: без этой проверки шестисекундное
+                    # ожидание перед последним повтором перепрыгивало дедлайн.
+                    pause = min(RETRY_DELAYS[attempt], max(0.0, deadline - _now()))
+                    logger.warning(f"{candidate}: {e}; повтор через {pause:.0f}с")
+                    await asyncio.sleep(pause)
                     continue
                 break
         logger.warning(f"Модель {candidate} не ответила, пробую запасную")
@@ -1571,16 +1600,25 @@ async def call_provider_api_once(provider_key: str, model_id: str, messages: lis
                                  temperature: float = 0.3) -> dict:
     """Нестриминговый вызов с теми же повторами и запасными моделями."""
     last_error = None
+    deadline = _now() + TOTAL_DEADLINE
     for candidate in _fallback_models(provider_key, model_id):
         for attempt in range(len(RETRY_DELAYS) + 1):
+            remaining = deadline - _now()
+            if remaining <= 1:
+                logger.warning(f"Бюджет {TOTAL_DEADLINE:.0f}с исчерпан, попытки прекращены")
+                raise last_error or TimeoutError(f"Модель не ответила за {TOTAL_DEADLINE:.0f}с")
             try:
                 return await _call_model_once(provider_key, candidate, messages,
-                                              tools=tools, temperature=temperature)
+                                              tools=tools, temperature=temperature,
+                                              timeout=min(ROUTE_TIMEOUT, remaining))
             except httpx.HTTPError as e:
                 last_error = e
                 if _is_retryable(e) and attempt < len(RETRY_DELAYS):
-                    logger.warning(f"{candidate}: {e}; повтор через {RETRY_DELAYS[attempt]}с")
-                    await asyncio.sleep(RETRY_DELAYS[attempt])
+                    # Пауза тоже тратит бюджет: без этой проверки шестисекундное
+                    # ожидание перед последним повтором перепрыгивало дедлайн.
+                    pause = min(RETRY_DELAYS[attempt], max(0.0, deadline - _now()))
+                    logger.warning(f"{candidate}: {e}; повтор через {pause:.0f}с")
+                    await asyncio.sleep(pause)
                     continue
                 break
         logger.warning(f"Модель {candidate} не ответила, пробую запасную")
@@ -2687,13 +2725,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 provider_key, model_id,
                 with_reasoning(msgs, model_id, ROUTE_REASONING), tools=tools)
 
+        research_started = _now()
         try:
-            messages, sources, images = await research.run_tool_loop(
-                llm_call, messages, on_progress=on_progress
+            # Общий бюджет на весь цикл: у каждого круга свой дедлайн, но кругов
+            # до шести, и без этого потолка поиск мог тянуться десятки минут.
+            messages, sources, images = await asyncio.wait_for(
+                research.run_tool_loop(llm_call, messages, on_progress=on_progress),
+                timeout=RESEARCH_BUDGET,
             )
+        except asyncio.TimeoutError:
+            logger.warning(f"Поиск не уложился в {RESEARCH_BUDGET:.0f}с, отвечаю без него")
         except Exception as e:
             # Поиск не критичен: отвечаем по памяти, но честно логируем.
             logger.error(f"Веб-поиск не удался, отвечаю без него: {e}")
+        logger.info(f"Этап поиска занял {_now() - research_started:.1f}с, "
+                    f"источников: {len(sources)}")
 
         if sources:
             # Инструкция идёт последней репликой, чтобы модель применила её
@@ -2807,6 +2853,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await timer_task
 
     full_text = "".join(all_parts).strip()
+    logger.info(f"Ответ готов за {_now() - start_time:.1f}с, символов: {len(full_text)}")
     # Маркеры [imgN] нужны только странице Telegraph — там они станут
     # картинками. В сообщении и в истории диалога они лишний шум.
     page_text = full_text
