@@ -32,6 +32,7 @@ Telegram-бот на моделях NVIDIA API со стримингом отв�
 | `lightning-30b` | `nvidia/nemotron-3.5-lightning-30b-a3b` | 149 | 4.0с |
 | `inkling` | `thinkingmachines/inkling` | 36 | 7.5с |
 | `minimax-m3` | `minimaxai/minimax-m3` | 7–17 | 2.7с |
+| `deepseek-flash` | `deepseek-ai/deepseek-v4-flash-0731` | не замерено | не замерено |
 
 `glimmer-30b` — модель Meta, на NVIDIA API она лежит под префиксом `meta/`, а не
 `nvidia/`. Это рассуждающая модель: «думание» уходит отдельным полем
@@ -43,6 +44,18 @@ Telegram-бот на моделях NVIDIA API со стримингом отв�
 
 ```bash
 python test_flash.py meta/muse-glimmer-30b
+```
+
+`deepseek-flash` — с неё бот и начинался, потом её сменили на Qwen. Размышления
+у DeepSeek V4 включаются **явно** (`chat_template_kwargs: {thinking: true}`),
+то есть по умолчанию модель отвечает сразу, без прохода размышлений — для чата
+это ровно то, чего не хватает `glimmer-30b`. В списке стоит последней намеренно:
+пока она не проверена на текущем каталоге, в запасные модели не попадает
+(`_fallback_models` берёт первые `MAX_FALLBACKS`), но в `/menu` выбирается.
+Проверить, что ключ её видит:
+
+```bash
+python test_models.py deepseek-ai/deepseek-v4-flash-0731
 ```
 
 Пропускная способность публичного эндпоинта плавает в зависимости от нагрузки, так что

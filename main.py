@@ -85,6 +85,14 @@ PROVIDERS = {
             "lightning-30b": "nvidia/nemotron-3.5-lightning-30b-a3b",
             "inkling": "thinkingmachines/inkling",
             "minimax-m3": "minimaxai/minimax-m3",
+            # Бот на ней и начинался (коммит 7d8616e), потом её сменили на Qwen.
+            # Размышления у DeepSeek V4 включаются явно (chat_template_kwargs:
+            # thinking), то есть по умолчанию она отвечает сразу — для чата это
+            # ровно то, чего не хватает glimmer-30b.
+            # Стоит последней намеренно: пока не проверена на текущем каталоге,
+            # в запасные модели (_fallback_models берёт первые MAX_FALLBACKS)
+            # она не попадает, но в /menu выбирается.
+            "deepseek-flash": "deepseek-ai/deepseek-v4-flash-0731",
         },
         "default": "glimmer-30b",
         # Размер контекста NVIDIA в API не сообщает (в /v1/models только id и
