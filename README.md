@@ -196,6 +196,24 @@ python list_models.py --all     # весь каталог
 python main.py
 ```
 
+## Тесты
+
+Что и когда чинилось — в [CHANGELOG.md](CHANGELOG.md).
+
+Офлайн, без ключей и без обращений к API:
+
+```bash
+python test_regressions.py        # разметка, счёт собеседования, настройки, команды
+python test_interview_routing.py  # маршрутизация текста во время интервью
+```
+
+Остальные `test_*.py` — разведочные скрипты по живому API: им нужен
+`NVIDIA_API_KEY`, и они тратят запросы.
+
+Премиальные эмодзи `<tg-emoji>` доступны только ботам с дополнительным именем,
+купленным на Fragment. Если Telegram отвергает разметку сообщений целиком —
+выключите их переменной `CUSTOM_EMOJI=0`.
+
 ## Деплой (Docker + Railway)
 
 **Важно про сохранение данных.** `progress.json` — единственный файл, который бот пишет
@@ -233,6 +251,10 @@ docker build -t telegram-bot .
 ```
 numbertree_bot/
 ├── main.py          # Основной код бота
+├── research.py      # Веб-поиск (Tavily) и цикл tool calling
+├── telegraph.py     # Публикация длинных ответов на telegra.ph
+├── tables.py        # Markdown-таблицы в моноширинный вид
+├── interview.json   # База вопросов для /interview
 ├── roadmap.json     # Каталог языков + готовые шаблоны стеков (редактируйте под себя)
 ├── progress.json    # Настройки стека и прогресс пользователей (создаётся автоматически)
 ├── requirements.txt # Зависимости
