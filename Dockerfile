@@ -1,5 +1,8 @@
 FROM python:3.11-slim
 
+# Без этого логи Railway приезжают пачками с задержкой
+ENV PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
 COPY requirements.txt .

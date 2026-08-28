@@ -7,3 +7,8 @@ __pycache__
 .env.example
 Dockerfile
 .dockerignore
+progress.json
+progress.json.tmp
+*.log
+venv
+.venv

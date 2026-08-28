@@ -1,15 +1,24 @@
 name: Bot Schedule (09:00-01:00 MSK = 16h/day)
 
+# MSK = UTC+3, поэтому 09:00 MSK = 06:00 UTC, а 01:00 MSK = 22:00 UTC накануне.
 on:
   schedule:
-    # 09:00 MSK = 06:00 UTC
     - cron: '0 6 * * *'
-    # 01:00 MSK (next day) = 22:00 UTC
     - cron: '0 22 * * *'
   workflow_dispatch:
+    inputs:
+      action:
+        description: Что сделать вручную
+        required: true
+        default: start
+        type: choice
+        options: [start, stop]
 
 permissions:
   contents: read
+
+env:
+  RAILWAY_SERVICE: numbertree_bot
 
 jobs:
   control:
@@ -18,14 +27,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: railway/cli@v3
-        with:
-          token: ${{ secrets.RAILWAY_TOKEN }}
+      # Официального GitHub Action у Railway нет: раньше здесь стояло
+      # `uses: railway/cli@v3`, но такого репозитория не существует (404),
+      # поэтому шаг падал на резолве и расписание не срабатывало.
+      # Штатный способ для CI — поставить CLI из npm.
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
 
-      - name: Start Bot (09:00 MSK)
-        if: github.event.schedule == '0 6 * * *'
-        run: railway up --service=numbertree_bot
+      # RAILWAY_TOKEN с токеном проекта не требует railway link.
+      - name: Start Bot
+        if: github.event.schedule == '0 6 * * *' || inputs.action == 'start'
+        run: railway up --service "$RAILWAY_SERVICE" --detach
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
 
-      - name: Stop Bot (01:00 MSK)
-        if: github.event.schedule == '0 22 * * *'
-        run: railway down --service=numbertree_bot
+      # Без --yes CLI ждёт подтверждения в интерактивном режиме и висит до таймаута.
+      - name: Stop Bot
+        if: github.event.schedule == '0 22 * * *' || inputs.action == 'stop'
+        run: railway down --service "$RAILWAY_SERVICE" --yes
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
