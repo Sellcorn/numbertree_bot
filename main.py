@@ -634,8 +634,14 @@ async def _interview_poll_result(update: Update, iinfo: dict):
     )
 
 
-async def _is_interview_active(chat_id: int) -> bool:
-    """True, если для чата уже запущена сессия техсобеседования."""
+def _is_interview_active(chat_id: int) -> bool:
+    """True, если для чата уже запущена сессия техсобеседования.
+
+    Синхронная намеренно: функция ничего не ждёт, а объявленная через async она
+    возвращала в `if` корутину — всегда истинную. Из-за этого перехватчик
+    интервью срабатывал на КАЖДОМ сообщении, и слова «стоп» или «дальше»
+    уходили в собеседование, которого никто не начинал.
+    """
     return chat_id in INTERVIEW_SESSIONS
 
 
@@ -1033,6 +1039,64 @@ def md_to_html(text: str) -> str:
     for index, block in enumerate(pre_blocks):
         html = html.replace(f"zqPREBLOCK{index}qz", block)
     return html.strip()
+
+
+# Реплики, на которые в интернет ходить заведомо незачем. Нужны, потому что шаг
+# поиска стоит ОТДЕЛЬНОГО обращения к модели: она сначала решает «искать или
+# нет», и только потом пишет ответ. У рассуждающей модели это решение само по
+# себе стоит полного прохода размышлений, то есть «привет» оплачивается дважды.
+#
+# Совпадение считается только ЦЕЛИКОМ — тот же принцип, что у
+# INTERVIEW_COMMANDS: «привет, найди курс биткоина» это уже не приветствие,
+# и решать про поиск там должна модель. Список намеренно короткий: лучше
+# лишний раз спросить модель, чем проглотить вопрос, которому поиск нужен.
+SMALL_TALK = {
+    # приветствия
+    "привет", "приветик", "прив", "здравствуй", "здравствуйте", "хай", "ку",
+    "доброе утро", "добрый день", "добрый вечер", "hi", "hello", "hey", "yo",
+    # прощания
+    "пока", "до свидания", "спокойной ночи", "бай", "bye", "goodbye",
+    # благодарности и вежливость
+    "спасибо", "спс", "благодарю", "пожалуйста", "thanks", "thank you",
+    # подтверждения
+    "ок", "окей", "ok", "okay", "ага", "угу", "да", "нет", "понятно", "понял",
+    "поняла", "ясно", "хорошо", "отлично", "супер", "круто", "класс",
+    # болтовня и проверка связи
+    "как дела", "как ты", "как жизнь", "чем занимаешься", "how are you",
+    "тест", "test", "проверка", "ты тут", "ты здесь",
+}
+
+
+# Muse Glimmer читает силу рассуждений из системного промпта — так написано в
+# карточке модели: «Reasoning strength: <low|medium|high|xhigh>», по умолчанию
+# high. Спецпараметра API для этого нет, поэтому строка идёт обычным system.
+#
+# Сил две, потому что вызова два. Маршрутный решает единственный вопрос —
+# «нужен ли интернет»; думать там нечего, а high стоит полного прохода
+# размышлений перед КАЖДЫМ сообщением. Ответу оставляем середину.
+REASONING_MODELS = {"meta/muse-glimmer-30b"}
+ROUTE_REASONING = os.getenv("ROUTE_REASONING", "low")
+ANSWER_REASONING = os.getenv("ANSWER_REASONING", "medium")
+
+
+def with_reasoning(messages: list[dict], model_id: str, strength: str) -> list[dict]:
+    """Добавляет системную строку с силой рассуждений, если модель её понимает.
+
+    Список не меняется на месте: research.run_tool_loop держит свою историю, и
+    строка не должна в ней накапливаться от круга к кругу.
+    """
+    if model_id not in REASONING_MODELS or not strength:
+        return messages
+    return [{"role": "system", "content": f"Reasoning strength: {strength}"}] + list(messages)
+
+
+def is_small_talk(text: str) -> bool:
+    """True, если реплика целиком — приветствие или болтовня.
+
+    Свободный текст сюда не попадает: «расскажи про привет» останется вопросом.
+    """
+    normalized = " ".join((text or "").lower().split()).strip(" .,!?…:;)(-—")
+    return normalized in SMALL_TALK
 
 
 def should_respond(update: Update) -> bool:
@@ -2582,9 +2646,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Веб-поиск: решает сама модель через tool calling. Без ключа Tavily
     # шаг пропускается целиком и бот отвечает как раньше.
+    # На «привет» и прочую болтовню модель не спрашиваем вовсе: шаг поиска
+    # стоит ОТДЕЛЬНОГО обращения к ней, и на приветствии оно тратится впустую.
     sources = []
     images = []
-    if research.is_enabled():
+    if research.is_enabled() and not is_small_talk(user_text):
         progress_lines = []
         last_progress_edit = 0.0
 
@@ -2616,7 +2682,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await render_progress()
 
         async def llm_call(msgs, tools):
-            return await call_provider_api_once(provider_key, model_id, msgs, tools=tools)
+            # На маршрутном вызове думать нечего — вопрос бинарный.
+            return await call_provider_api_once(
+                provider_key, model_id,
+                with_reasoning(msgs, model_id, ROUTE_REASONING), tools=tools)
 
         try:
             messages, sources, images = await research.run_tool_loop(
@@ -2700,7 +2769,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fallback_model = model
 
     try:
-        async for token, u in call_provider_api(provider_key, model_id, messages,
+        async for token, u in call_provider_api(provider_key, model_id,
+                                                with_reasoning(messages, model_id, ANSWER_REASONING),
                                                 on_fallback=note_fallback):
             all_parts.append(token)
             full_text = "".join(all_parts)

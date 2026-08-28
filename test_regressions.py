@@ -134,7 +134,39 @@ check("словарь обрезан до потолка", len(store), main.MAX_
 check_true("выброшены самые старые ключи", 0 not in store and 509 in store)
 
 
-total = 22
+# ---------- поиск не запускается на болтовне ----------
+# Регрессия: шаг веб-поиска стоит ОТДЕЛЬНОГО обращения к модели («искать или
+# нет»), и на «привет» оно тратилось впустую. У рассуждающей модели это второй
+# полный проход размышлений, то есть приветствие оплачивалось дважды.
+for text in ("привет", "Привет!", "  спасибо  ", "как дела?", "ок", "hello"):
+    check_true(f"{text!r} — болтовня", main.is_small_talk(text))
+for text in ("Какая сейчас последняя версия Go?", "привет, найди курс биткоина",
+             "что такое горутина", "расскажи про привет", ""):
+    check_true(f"{text!r} — НЕ болтовня", not main.is_small_talk(text))
+
+
+# ---------- сила рассуждений ----------
+# Muse Glimmer читает её из системного промпта; маршрутному вызову high не нужен.
+msgs = [{"role": "user", "content": "x"}]
+routed = main.with_reasoning(msgs, "meta/muse-glimmer-30b", "low")
+check("маршруту — низкая сила", routed[0], {"role": "system", "content": "Reasoning strength: low"})
+check("исходный список не тронут", len(msgs), 1)
+check("дважды не накапливается", len(main.with_reasoning(msgs, "meta/muse-glimmer-30b", "low")), 2)
+check("чужая модель без system",
+      main.with_reasoning(msgs, "nvidia/nemotron-3-super-120b-a12b", "low"), msgs)
+
+
+# ---------- перехватчик интервью ----------
+# Регрессия: _is_interview_active был async и в `if` давал корутину — всегда
+# истинную, поэтому «стоп» и «дальше» уходили в несуществующее собеседование.
+main.INTERVIEW_SESSIONS.clear()
+check("без сессии интервью неактивно", main._is_interview_active(42), False)
+main.INTERVIEW_SESSIONS[42] = {"score": 0, "total": 0}
+check("с сессией интервью активно", main._is_interview_active(42), True)
+main.INTERVIEW_SESSIONS.clear()
+
+
+total = 26
 if failures:
     print(f"ПРОВАЛЕНО {len(failures)}:")
     print("\n".join(failures))
