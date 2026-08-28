@@ -64,22 +64,33 @@ PROVIDERS = {
         "api_key": os.getenv("NVIDIA_API_KEY"),
         "api_url": f"{NVIDIA_API_BASE}/chat/completions",
         # Скорость замерена одним промптом в одном окне (ток/с, первый токен):
+        #   glimmer-30b    не замерено — модель рассуждающая, см. ниже
         #   super-120b     115 ток/с, 1.3с — класс M3, но кратно быстрее
         #   lightning-30b  149 ток/с, 4.0с — самая быстрая, модель полегче
         #   ultra-550b      47 ток/с, 3.4с — самая мощная из доступных
         #   inkling         36 ток/с, 7.5с
         #   minimax-m3    7-17 ток/с, 2.7с — заметно медленнее остальных
+        #
+        # glimmer-30b — модель Meta, на NVIDIA API лежит под префиксом meta/,
+        # а не nvidia/. Рассуждения она отдаёт отдельным полем reasoning_content,
+        # поэтому в ответ они не попадают, но бюджет max_tokens тратят вместе с
+        # ответом: если длинные ответы начнут обрываться, поднимайте max_tokens
+        # в _stream_model или снижайте reasoning_strength.
+        # Порядок важен: первые ключи после текущего идут в запасные модели
+        # (_fallback_models берёт следующие MAX_FALLBACKS штук).
         "models": {
+            "glimmer-30b": "meta/muse-glimmer-30b",
             "super-120b": "nvidia/nemotron-3-super-120b-a12b",
             "ultra-550b": "nvidia/nemotron-3-ultra-550b-a55b",
             "lightning-30b": "nvidia/nemotron-3.5-lightning-30b-a3b",
             "inkling": "thinkingmachines/inkling",
             "minimax-m3": "minimaxai/minimax-m3",
         },
-        "default": "super-120b",
+        "default": "glimmer-30b",
         # Размер контекста NVIDIA в API не сообщает (в /v1/models только id и
-        # owner) и переполнение не отвергает. Значение измерено: все пять
-        # моделей приняли промпт на 115k токенов, super-120b — на 360k.
+        # owner) и переполнение не отвергает. Значение измерено вручную: пять
+        # прежних моделей приняли промпт на 115k токенов, super-120b — на 360k;
+        # у glimmer-30b карточка заявляет 131k, замером не проверялось.
         # Берём консервативные 128k как ориентир для индикатора.
         "context": 128000,
     },
