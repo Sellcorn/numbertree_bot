@@ -148,6 +148,9 @@ for text in ("Какая сейчас последняя версия Go?", "п�
 # ---------- модель по умолчанию и запасные ----------
 # Регрессия: дефолтом стояла рассуждающая модель. Она молчит, пока думает, и
 # первый токен приходил через десятки секунд — в чате это «бот завис».
+# Запрет на Muse относится к каталогу NVIDIA: там она отдавала первый токен за
+# 7.5с. На OpenRouter она вернулась дефолтом, но с minimal — см. блок про
+# OpenRouter ниже, он держит быструю глубину размышлений.
 _nvidia = main.PROVIDERS["nvidia"]
 check("дефолт — Nemotron Super",
       _nvidia["models"][_nvidia["default"]], "nvidia/nemotron-3-super-120b-a12b")
@@ -190,6 +193,9 @@ main.INTERVIEW_SESSIONS.clear()
 # молчащей модели пользователь ждал больше 1000с вместо ответа или ошибки.
 import asyncio
 import json
+import re
+import types
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -316,7 +322,136 @@ check_true("таймауты разнесены по фазам",
            and main.request_timeout(42.0).connect == main.CONNECT_TIMEOUT)
 
 
-total = 32
+# ---------- OpenRouter: дефолтная Muse Spark ----------
+# Рассуждающая модель снова стоит дефолтом, и прежняя беда возвращается ровно
+# тогда, когда размышления становятся долгими: ход мыслей идёт в delta.reasoning,
+# который _stream_model не читает, поэтому всё это время в чат не уходит ничего.
+# Замер на этом эндпоинте, три прогона на уровень: minimal — полный ответ за
+# 2-3с (уровень super-120b), medium — 7-22с, xhigh — 8-16с. Тест держит быструю
+# глубину: поднять её можно переменной, но не молча в коде.
+_or = main.PROVIDERS["openrouter"]
+check("провайдер по умолчанию — OpenRouter", main.DEFAULT_PROVIDER, "openrouter")
+check("дефолт — Muse Spark Contributor",
+      _or["models"][_or["default"]], "meta/muse-spark-1.3-contributor")
+check_true("глубина размышлений быстрая",
+           _or["extra_payload"]["reasoning"]["effort"] in ("minimal", "low"),
+           str(_or["extra_payload"]))
+check("запасная — та же Muse без тарифа contributor",
+      main._fallback_models("openrouter", "meta/muse-spark-1.3-contributor")[1:],
+      ["meta/muse-spark-1.3"])
+
+# Глубина обязана доезжать до провайдера в ОБОИХ вызовах: маршрутный «нужен ли
+# поиск» молчит, пока модель думает, точно так же.
+_seen_bodies = []
+
+
+def _capture_provider(request):
+    _seen_bodies.append(json.loads(request.content))
+    return _fake_provider(request)
+
+
+async def _effort_probe():
+    saved_key = main.PROVIDERS["openrouter"]["api_key"]
+    main.PROVIDERS["openrouter"]["api_key"] = "sk-or-test"
+    main._HTTP_CLIENT = httpx.AsyncClient(transport=httpx.MockTransport(_capture_provider))
+    model = "meta/muse-spark-1.3-contributor"
+    try:
+        async for _ in main.call_provider_api("openrouter", model, []):
+            pass
+        await main.call_provider_api_once("openrouter", model, [])
+        await main.close_http_client()
+    finally:
+        main.PROVIDERS["openrouter"]["api_key"] = saved_key
+        main._HTTP_CLIENT = None
+
+
+asyncio.run(_effort_probe())
+check("размышления уехали в оба запроса",
+      [b.get("reasoning", {}).get("effort") for b in _seen_bodies],
+      [main.OPENROUTER_REASONING_EFFORT] * 2)
+
+
+# ---------- таймер идёт с отправки сообщения ----------
+# Регрессия: отсчёт стартовал у самой генерации, а заглушка до этого висела с
+# жёстким «0с». Всё ожидание — доставка, поиск в интернете, размышления модели —
+# оставалось за кадром, и на рассуждающей модели это основная часть паузы.
+# _now() живёт внутри событийного цикла, поэтому проверки — корутиной.
+async def _start_time_probe():
+    lagged = types.SimpleNamespace(
+        date=datetime.now(timezone.utc) - timedelta(seconds=3))
+    shift = main._now() - main._message_start_time(lagged)
+    check_true("поправка на доставку учтена", 2.0 <= shift <= 4.0, str(shift))
+    # Часы Telegram и наши расходятся в обе стороны: обе бессмыслицы игнорируем,
+    # иначе пользователь увидит отрицательный отсчёт или сразу минуты.
+    for name, delta in (("часы позади", timedelta(seconds=-30)),
+                        ("расхождение больше потолка",
+                         timedelta(seconds=main.MAX_START_LAG + 60))):
+        m = types.SimpleNamespace(date=datetime.now(timezone.utc) - delta)
+        check_true(f"{name} — поправка отброшена",
+                   abs(main._message_start_time(m) - main._now()) < 0.5)
+
+
+asyncio.run(_start_time_probe())
+
+
+# Главное: секунды обязаны тикать ДО того, как придёт первый токен.
+_edits = []
+
+
+class _FakeSent:
+    async def edit_text(self, text, **kw):
+        _edits.append(text)
+        return self
+
+
+class _FakeIncoming:
+    def __init__(self):
+        self.text = "Что такое хвостовая рекурсия?"
+        self.entities = []
+        self.reply_to_message = None
+        self.chat = types.SimpleNamespace(type="private", id=777)
+        self.chat_id = 777
+        self.from_user = types.SimpleNamespace(id=42, first_name="t", username="t")
+        self.date = datetime.now(timezone.utc)
+
+    async def reply_text(self, text, **kw):
+        _edits.append(text)
+        return _FakeSent()
+
+
+async def _slow_model(provider_key, model_id, messages, on_fallback=None):
+    """Модель молчит дольше, чем интервал перерисовки, потом отвечает."""
+    await asyncio.sleep(main.PREVIEW_INTERVAL * 2.5)
+    yield "ответ", {}
+    yield "", {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+
+
+async def _timer_probe():
+    saved = main.call_provider_api
+    main.call_provider_api = _slow_model
+    try:
+        await main.handle_message(
+            types.SimpleNamespace(message=_FakeIncoming(),
+                                  effective_chat=types.SimpleNamespace(id=777)),
+            None)
+    finally:
+        main.call_provider_api = saved
+        main.CONVERSATION_HISTORY.clear()
+
+
+asyncio.run(_timer_probe())
+_ticks = [t for t in _edits if "Думаю" in t]
+_seconds = [int(m.group(1)) for t in _ticks
+            for m in [re.search(r"<i>(\d+)с</i>", t)] if m]
+check_true("заглушка перерисовывалась до первого токена", len(_ticks) >= 2,
+           str(len(_ticks)))
+check_true("секунды на ней росли", _seconds == sorted(_seconds) and max(_seconds) >= 1,
+           str(_seconds))
+check_true("предпросмотр не показан, пока нет токенов",
+           all("blockquote" not in t for t in _ticks))
+
+
+total = 45
 if failures:
     print(f"ПРОВАЛЕНО {len(failures)}:")
     print("\n".join(failures))

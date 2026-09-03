@@ -5,7 +5,7 @@ import json
 import logging
 import random
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import AsyncGenerator
 
 import httpx
@@ -80,8 +80,48 @@ def history_messages(history: list[dict]) -> list[dict]:
 # Настройки провайдеров и моделей
 # Эндпоинт можно переопределить через NVIDIA_API_BASE (например, свой прокси в докере).
 NVIDIA_API_BASE = os.getenv("NVIDIA_API_BASE", "https://integrate.api.nvidia.com/v1").rstrip("/")
+OPENROUTER_API_BASE = os.getenv("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1").rstrip("/")
+
+# Muse Spark размышляет всегда, отключить рассуждения нельзя — можно только
+# выбрать их глубину. А глубина здесь и есть время молчания: ход мыслей идёт в
+# delta.reasoning, который _stream_model не читает, поэтому в чат до конца
+# размышлений не уходит ни символа.
+#
+# Замерено на этом эндпоинте, три прогона на каждый уровень (полный ответ):
+#   minimal   ~2.0-3.0с   — на уровне super-120b, в чате незаметно
+#   medium    ~7-22с
+#   xhigh     ~8-16с, размышления съедают ~90% выходных токенов
+#
+# Отсюда minimal по умолчанию: бот отвечает в чат, а там пауза в десять секунд
+# читается как «завис». Для разовых тяжёлых задач поднимите через переменную.
+OPENROUTER_REASONING_EFFORT = os.getenv("OPENROUTER_REASONING_EFFORT", "minimal")
 
 PROVIDERS = {
+    "openrouter": {
+        "name": "OpenRouter",
+        "api_key": os.getenv("OPENROUTER_API_KEY"),
+        "api_url": f"{OPENROUTER_API_BASE}/chat/completions",
+        # Тариф contributor дешевле старшей версии в 12-20 раз ($0.10/$0.20 против
+        # $1.25/$4.25 за 1M токенов) ровно за то, что промпты уходят Meta на
+        # обучение. Разрешение выдаётся один раз в настройках аккаунта
+        # OpenRouter; без него эндпоинт отвечает 404 с «paid model training
+        # violation», а не тихо переключается на другой.
+        #
+        # Вторая модель — та же Muse Spark, но без тарифа contributor: она идёт
+        # запасной (_fallback_models берёт следующие за текущей) и остаётся
+        # выходом, когда отдавать промпты на обучение нельзя.
+        "models": {
+            "muse-spark": "meta/muse-spark-1.3-contributor",
+            "muse-spark-full": "meta/muse-spark-1.3",
+        },
+        "default": "muse-spark",
+        # Заявленное окно, оно же предел эндпоинта. В отличие от NVIDIA гадать
+        # не пришлось: OpenRouter отдаёт размер в /api/v1/models.
+        "context": 1048576,
+        # Глубина размышлений — см. OPENROUTER_REASONING_EFFORT выше. Уезжает в
+        # payload обоих вызовов, и стримингового, и маршрутного.
+        "extra_payload": {"reasoning": {"effort": OPENROUTER_REASONING_EFFORT}},
+    },
     "nvidia": {
         "name": "NVIDIA",
         "api_key": os.getenv("NVIDIA_API_KEY"),
@@ -169,7 +209,7 @@ def request_timeout(read: float) -> httpx.Timeout:
 
 
 # Пользовательские настройки: chat_id -> {provider, model}
-DEFAULT_PROVIDER = "nvidia"
+DEFAULT_PROVIDER = "openrouter"
 
 # ============ ROADMAP (конфигурация уровней и стека) ============
 # Читается из roadmap.json рядом с ботом. Содержит:
@@ -1440,6 +1480,9 @@ async def _stream_model(provider_key: str, model_id: str, messages: list[dict], 
         "temperature": temperature,
         "max_tokens": 8192,
     }
+    # Провайдерские добавки к телу запроса (у OpenRouter — глубина размышлений).
+    # NVIDIA такого ключа не знает и просто не имеет extra_payload.
+    payload.update(provider.get("extra_payload") or {})
     if stream:
         # NVIDIA присылает usage в стриме только по явному запросу
         payload["stream_options"] = {"include_usage": True}
@@ -1551,6 +1594,7 @@ async def _call_model_once(provider_key: str, model_id: str, messages: list[dict
         "temperature": temperature,
         "max_tokens": 2048,
     }
+    payload.update(provider.get("extra_payload") or {})
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
@@ -1598,6 +1642,33 @@ PREVIEW_INTERVAL = 1.5
 
 def _now() -> float:
     return asyncio.get_event_loop().time()
+
+
+# Потолок поправки на доставку. Часы Telegram и наши не синхронизированы, и без
+# потолка расхождение в минуты показало бы пользователю дикий отсчёт.
+MAX_START_LAG = 30.0
+
+
+def _message_start_time(message) -> float:
+    """Точка отсчёта таймера: когда пользователь нажал «отправить».
+
+    Между отправкой и входом в обработчик проходит время: бот забирает
+    сообщения опросом, и на перезапуске или под нагрузкой задержка доходит до
+    секунд. Считать от входа в обработчик — значит показывать меньше, чем
+    человек реально прождал.
+
+    Поправку берём, только когда она осмысленна: отрицательную (наши часы
+    позади телеграмовских) и слишком большую отбрасываем — в этих случаях
+    честнее показать заниженное время, чем выдуманное.
+    """
+    now = asyncio.get_event_loop().time()
+    try:
+        lag = (datetime.now(timezone.utc) - message.date).total_seconds()
+    except Exception:
+        return now
+    if not 0.0 < lag <= MAX_START_LAG:
+        return now
+    return now - lag
 
 
 # Бесплатный тариф NVIDIA NIM — ~40 запросов в минуту НА АККАУНТ, а не на модель.
@@ -2744,6 +2815,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not should_respond(update):
         return
 
+    # Таймер идёт с этого момента, а не с начала генерации: пользователь ждёт
+    # с того мига, как отправил сообщение, и поиск в интернете он ждёт тоже.
+    start_time = _message_start_time(update.message)
+
     # Пока идёт техсобеседование — интерпретируем реплики как команды интервью
     if (update.effective_chat and _is_interview_active(update.effective_chat.id)
             and update.message and update.message.text):
@@ -2773,8 +2848,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history = CONVERSATION_HISTORY.get(history_key, [])
 
     # Начальное сообщение с анимированным эмодзи
+    # Секунды тут уже могут быть не нулевыми: отсчёт идёт с отправки сообщения,
+    # а доставка и разбор занимают своё время. Дальше их крутит timer_updater.
     thinking_msg = await update.message.reply_text(
-        f"{emoji('thinking')} <b>Думаю...</b> ⏱ <i>0с</i>",
+        f"{emoji('thinking')} <b>Думаю...</b> ⏱ <i>{int(_now() - start_time)}с</i>",
         parse_mode=ParseMode.HTML
     )
 
@@ -2789,8 +2866,55 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     calls_at_start = API_REQUESTS["n"]
     all_parts = []
     first_token_at = None   # время до первого видимого токена — главная метрика
-    start_time = asyncio.get_event_loop().time()
     usage = {}
+
+    # Заглушку правит ТОЛЬКО фоновая задача ниже, и правит её с самого начала —
+    # ещё до поиска и до первого токена. Этапы кладут сюда, ЧТО показывать, а
+    # когда перерисовать, решает таймер.
+    #
+    # Раньше редакторов было два: этап поиска правил сообщение сам, а таймер
+    # включался только перед генерацией. Из-за этого счётчик стоял на нуле всё
+    # время поиска, а два независимых редактора одного сообщения упирались во
+    # флуд-контроль Telegram.
+    status = {
+        "header": f"{emoji('thinking')} <b>Думаю...</b>",
+        "suffix": "",
+        "body": "",
+        "preview": False,   # True — вместо body показываем текст ответа по мере прихода
+    }
+    stop_timer = asyncio.Event()
+
+    def render_status() -> str:
+        elapsed = int(_now() - start_time)
+        head = f"{status['header']} ⏱ <i>{elapsed}с</i>{status['suffix']}"
+        if status["preview"]:
+            body = f"<blockquote expandable>{''.join(all_parts)[-2500:]}</blockquote>"
+        else:
+            body = status["body"]
+        return f"{head}\n\n{body}" if body else head
+
+    async def timer_updater():
+        last_text = ""
+        while True:
+            try:
+                # Не sleep: по готовности ответа задача обязана проснуться
+                # немедленно. На sleep(2) финальное сообщение ждало конца сна —
+                # до двух лишних секунд молчания на КАЖДОМ ответе.
+                await asyncio.wait_for(stop_timer.wait(), timeout=PREVIEW_INTERVAL)
+                return
+            except asyncio.TimeoutError:
+                pass
+            text = render_status()
+            if text == last_text:
+                continue
+            try:
+                await thinking_msg.edit_text(text, parse_mode=ParseMode.HTML,
+                                             disable_web_page_preview=True)
+                last_text = text
+            except Exception:
+                pass
+
+    timer_task = asyncio.create_task(timer_updater())
 
     # Веб-поиск: решает сама модель через tool calling. Без ключа Tavily
     # шаг пропускается целиком и бот отвечает как раньше.
@@ -2800,7 +2924,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     images = []
     if research.is_enabled() and not is_small_talk(user_text):
         progress_lines = []
-        last_progress_edit = 0.0
 
         def _esc_line(s: str) -> str:
             return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -2809,24 +2932,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Показываем хвост: строк набегает много, а у Telegram лимит 4096 символов.
             shown = "\n".join(_esc_line(l) for l in progress_lines[-14:])
             tail = f"\n\n{footer}" if footer else ""
-            try:
-                await thinking_msg.edit_text(
-                    f"{emoji('thinking')} <b>Ищу в интернете...</b>\n\n{shown}{tail}",
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
-            except Exception:
-                pass
+            status["header"] = f"{emoji('thinking')} <b>Ищу в интернете...</b>"
+            status["body"] = f"{shown}{tail}"
 
         async def on_progress(line: str):
-            nonlocal last_progress_edit
             progress_lines.append(line)
-            # Троттлинг: на один ответ приходится под полсотни строк, и без паузы
-            # Telegram включает флуд-контроль на правках сообщения.
-            now = asyncio.get_event_loop().time()
-            if now - last_progress_edit < 1.2:
-                return
-            last_progress_edit = now
+            # Своего троттлинга больше нет: сообщение перерисовывает таймер раз
+            # в PREVIEW_INTERVAL, и он же не даёт упереться во флуд-контроль.
             await render_progress()
 
         async def llm_call(msgs, tools):
@@ -2881,43 +2993,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             })
 
         if progress_lines:
-            # Финальный сброс: показать всё, что не успело попасть из-за троттлинга.
+            # Финальный сброс: дописать подвал к последнему состоянию прогресса.
             footer = (f"<b>Прочитал {len(sources)} источников, формулирую ответ...</b>"
                       if sources else "")
             await render_progress(footer)
 
-    # Заглушку правит ТОЛЬКО эта фоновая задача — таймер и предпросмотр разом.
-    # Раньше её правил ещё и цикл чтения токенов, каждые 300 символов, и на
-    # время правки (запрос в Telegram и ответ от него) переставал вычитывать
-    # поток: ответ печатался медленнее, чем модель его отдавала.
-    stop_timer = asyncio.Event()
-
-    async def timer_updater():
-        last_timer_text = ""
-        while True:
-            try:
-                # Не sleep: по готовности ответа задача обязана проснуться
-                # немедленно. На sleep(2) финальное сообщение ждало конца сна —
-                # до двух лишних секунд молчания на КАЖДОМ ответе.
-                await asyncio.wait_for(stop_timer.wait(), timeout=PREVIEW_INTERVAL)
-                return
-            except asyncio.TimeoutError:
-                pass
-            elapsed = int(_now() - start_time)
-            preview = "".join(all_parts)[-2500:]
-            timer_text = (
-                f"{emoji('thinking')} <b>Пишу ответ...</b> ⏱ <i>{elapsed}с</i> ({provider_name})\n\n"
-                f"<blockquote expandable>{preview}</blockquote>"
-            )
-            if timer_text == last_timer_text:
-                continue
-            try:
-                await thinking_msg.edit_text(timer_text, parse_mode=ParseMode.HTML)
-                last_timer_text = timer_text
-            except Exception:
-                pass
-
-    timer_task = asyncio.create_task(timer_updater())
+    # Дальше отвечает модель — приписываем к таймеру, какая именно. Заголовок
+    # пока не трогаем: пока нет ни одного токена, «Пишу ответ...» было бы
+    # неправдой, а на рассуждающей модели это ощутимый кусок ожидания.
+    status["suffix"] = f" ({provider_name})"
 
     fallback_model = None
 
@@ -2936,6 +3020,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Пока модель не отдала первый токен, в чате «бот завис».
                 # Отделяем этот интервал от скорости самой генерации.
                 first_token_at = _now() - start_time
+                # Ответ пошёл: заглушка переключается с ожидания на предпросмотр.
+                # Таймер при этом не сбрасывается — он идёт с отправки сообщения.
+                status["header"] = f"{emoji('thinking')} <b>Пишу ответ...</b>"
+                status["preview"] = True
             if token:
                 all_parts.append(token)
             if u:
