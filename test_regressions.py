@@ -145,15 +145,34 @@ for text in ("Какая сейчас последняя версия Go?", "п�
     check_true(f"{text!r} — НЕ болтовня", not main.is_small_talk(text))
 
 
-# ---------- сила рассуждений ----------
-# Muse Glimmer читает её из системного промпта; маршрутному вызову high не нужен.
-msgs = [{"role": "user", "content": "x"}]
-routed = main.with_reasoning(msgs, "meta/muse-glimmer-30b", "low")
-check("маршруту — низкая сила", routed[0], {"role": "system", "content": "Reasoning strength: low"})
-check("исходный список не тронут", len(msgs), 1)
-check("дважды не накапливается", len(main.with_reasoning(msgs, "meta/muse-glimmer-30b", "low")), 2)
-check("чужая модель без system",
-      main.with_reasoning(msgs, "nvidia/nemotron-3-super-120b-a12b", "low"), msgs)
+# ---------- модель по умолчанию и запасные ----------
+# Регрессия: дефолтом стояла рассуждающая модель. Она молчит, пока думает, и
+# первый токен приходил через десятки секунд — в чате это «бот завис».
+_nvidia = main.PROVIDERS["nvidia"]
+check("дефолт — Nemotron Super",
+      _nvidia["models"][_nvidia["default"]], "nvidia/nemotron-3-super-120b-a12b")
+check_true("рассуждающая Muse убрана из меню",
+           not any("muse" in m for m in _nvidia["models"].values()),
+           str(list(_nvidia["models"].values())))
+# Запасные берутся по порядку словаря: подмена модели не должна оказаться
+# медленнее той, что не ответила.
+check("запасные — самые быстрые из оставшихся",
+      main._fallback_models("nvidia", "nvidia/nemotron-3-super-120b-a12b")[1:],
+      ["nvidia/nemotron-3.5-lightning-30b-a3b", "nvidia/nemotron-3-ultra-550b-a55b"])
+
+
+# ---------- история не раздувает промпт ----------
+# Регрессия: история уходит в модель дважды за сообщение (маршрутный вызов +
+# ответ), и десять развёрнутых ответов превращались в десятки тысяч токенов
+# префилла — а он целиком лежит в ожидании первого токена.
+_hist = [{"user": "a", "assistant": "x" * 5000}, {"user": "b", "assistant": "y" * 5000}]
+_msgs = main.history_messages(_hist)
+check("реплик столько же", len(_msgs), 4)
+check_true("старый ответ обрезан",
+           len(_msgs[1]["content"]) <= main.MAX_OLD_REPLY_CHARS + 20,
+           str(len(_msgs[1]["content"])))
+check("последний ответ идёт целиком", _msgs[3]["content"], "y" * 5000)
+check("вопросы пользователя не трогаем", _msgs[0]["content"], "a")
 
 
 # ---------- перехватчик интервью ----------
@@ -170,6 +189,8 @@ main.INTERVIEW_SESSIONS.clear()
 # Регрессия: повторы перемножались (3 попытки x 3 модели = 9 обращений), и при
 # молчащей модели пользователь ждал больше 1000с вместо ответа или ошибки.
 import asyncio
+import json
+
 import httpx
 
 
@@ -194,7 +215,7 @@ async def _deadline_probe():
     try:
         t0 = loop.time()
         try:
-            async for _ in main.call_provider_api("nvidia", "meta/muse-glimmer-30b", []):
+            async for _ in main.call_provider_api("nvidia", "nvidia/nemotron-3-super-120b-a12b", []):
                 pass
         except Exception:
             pass
@@ -202,7 +223,7 @@ async def _deadline_probe():
 
         t0 = loop.time()
         try:
-            await main.call_provider_api_once("nvidia", "meta/muse-glimmer-30b", [])
+            await main.call_provider_api_once("nvidia", "nvidia/nemotron-3-super-120b-a12b", [])
         except Exception:
             pass
         once_took = loop.time() - t0
@@ -219,7 +240,83 @@ check_true(f"маршрутный вызов уложился в бюджет ({
 check_true("бюджет поиска задан", main.RESEARCH_BUDGET > 0)
 
 
-total = 29
+# ---------- предпросмотр не задерживает финальный ответ ----------
+# Регрессия: фоновая задача таймера спала фиксированные 2с, и код ответа ждал
+# конца сна — до двух лишних секунд молчания на КАЖДОМ ответе.
+async def _preview_probe():
+    stop = asyncio.Event()
+
+    async def updater():
+        while True:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=main.PREVIEW_INTERVAL)
+                return
+            except asyncio.TimeoutError:
+                pass
+
+    loop = asyncio.get_event_loop()
+    task = asyncio.create_task(updater())
+    await asyncio.sleep(0)
+    t0 = loop.time()
+    stop.set()
+    await task
+    return loop.time() - t0
+
+
+_preview_took = asyncio.run(_preview_probe())
+check_true(f"таймер останавливается сразу ({_preview_took * 1000:.0f}мс)",
+           _preview_took < 0.2, f"{_preview_took:.2f}s")
+
+
+# ---------- общий HTTP-клиент ----------
+# Регрессия: под каждый запрос к модели поднимался свой httpx.AsyncClient, то
+# есть полное TLS-рукопожатие на каждое из восьми обращений за один вопрос.
+# Клиент теперь общий — проверяем, что оба вызова через него по-прежнему
+# разбирают ответ провайдера. Сеть не трогаем: MockTransport.
+def _fake_provider(request):
+    body = json.loads(request.content)
+    if body.get("stream"):
+        chunks = [
+            'data: {"choices":[{"delta":{"content":"При"}}]}',
+            'data: {"choices":[{"delta":{"content":"вет"}}]}',
+            'data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,'
+            '"total_tokens":12}}',
+            "data: [DONE]",
+        ]
+        return httpx.Response(200, text="\n\n".join(chunks) + "\n\n")
+    return httpx.Response(200, json={"choices": [{"message": {"content": "нет"}}]})
+
+
+async def _http_probe():
+    saved_key = main.PROVIDERS["nvidia"]["api_key"]
+    main.PROVIDERS["nvidia"]["api_key"] = "nvapi-test"
+    main._HTTP_CLIENT = httpx.AsyncClient(transport=httpx.MockTransport(_fake_provider))
+    model = "nvidia/nemotron-3-super-120b-a12b"
+    try:
+        tokens, usage = [], {}
+        async for token, u in main.call_provider_api("nvidia", model, []):
+            tokens.append(token)
+            if u:
+                usage = u
+        message = await main.call_provider_api_once("nvidia", model, [])
+        await main.close_http_client()
+        return "".join(tokens), usage, message, main._HTTP_CLIENT
+    finally:
+        main.PROVIDERS["nvidia"]["api_key"] = saved_key
+        main._HTTP_CLIENT = None
+
+
+_text, _usage, _message, _closed = asyncio.run(_http_probe())
+check("поток собран из чанков", _text, "Привет")
+check("usage из финального чанка прочитан", _usage.get("total_tokens"), 12)
+check("нестриминговый вызов вернул message", _message.get("content"), "нет")
+check("после close_http_client клиента нет", _closed, None)
+check_true("таймауты разнесены по фазам",
+           main.request_timeout(42.0).read == 42.0
+           and main.request_timeout(42.0).connect == main.CONNECT_TIMEOUT)
+
+
+total = 32
 if failures:
     print(f"ПРОВАЛЕНО {len(failures)}:")
     print("\n".join(failures))

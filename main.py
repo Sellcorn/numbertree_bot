@@ -1,5 +1,6 @@
 import os
 import asyncio
+import contextlib
 import json
 import logging
 import random
@@ -54,6 +55,28 @@ def _trim_store(store: dict, limit: int = MAX_TRACKED_CHATS):
     while len(store) > limit:
         store.pop(next(iter(store)))
 
+
+# История уходит в модель ДВАЖДЫ на сообщение: сначала маршрутным вызовом
+# «нужен ли поиск», потом самим ответом. Развёрнутый ответ с поиском бывает на
+# десять тысяч символов, десять таких в личке — это десятки тысяч токенов
+# префилла, и они целиком лежат в ожидании первого токена.
+# Последний обмен идёт полностью (именно на него ссылаются «а теперь перепиши»),
+# ответы постарше обрезаются: смысл в них остаётся, объём — нет.
+MAX_OLD_REPLY_CHARS = 1200
+
+
+def history_messages(history: list[dict]) -> list[dict]:
+    """Разворачивает историю в реплики для API, обрезая старые ответы бота."""
+    messages = []
+    last = len(history) - 1
+    for i, h in enumerate(history):
+        reply = h["assistant"]
+        if i != last and len(reply) > MAX_OLD_REPLY_CHARS:
+            reply = reply[:MAX_OLD_REPLY_CHARS].rstrip() + " […ответ обрезан]"
+        messages.append({"role": "user", "content": h["user"]})
+        messages.append({"role": "assistant", "content": reply})
+    return messages
+
 # Настройки провайдеров и моделей
 # Эндпоинт можно переопределить через NVIDIA_API_BASE (например, свой прокси в докере).
 NVIDIA_API_BASE = os.getenv("NVIDIA_API_BASE", "https://integrate.api.nvidia.com/v1").rstrip("/")
@@ -64,45 +87,86 @@ PROVIDERS = {
         "api_key": os.getenv("NVIDIA_API_KEY"),
         "api_url": f"{NVIDIA_API_BASE}/chat/completions",
         # Скорость замерена одним промптом в одном окне (ток/с, первый токен):
-        #   glimmer-30b    не замерено — модель рассуждающая, см. ниже
-        #   super-120b     115 ток/с, 1.3с — класс M3, но кратно быстрее
+        #   super-120b     115 ток/с, 1.3с — рабочая лошадка, отвечает сразу
         #   lightning-30b  149 ток/с, 4.0с — самая быстрая, модель полегче
         #   ultra-550b      47 ток/с, 3.4с — самая мощная из доступных
         #   inkling         36 ток/с, 7.5с
         #   minimax-m3    7-17 ток/с, 2.7с — заметно медленнее остальных
         #
-        # glimmer-30b — модель Meta, на NVIDIA API лежит под префиксом meta/,
-        # а не nvidia/. Рассуждения она отдаёт отдельным полем reasoning_content,
-        # поэтому в ответ они не попадают, но бюджет max_tokens тратят вместе с
-        # ответом: если длинные ответы начнут обрываться, поднимайте max_tokens
-        # в _stream_model или снижайте reasoning_strength.
-        # Порядок важен: первые ключи после текущего идут в запасные модели
-        # (_fallback_models берёт следующие MAX_FALLBACKS штук).
+        # Рассуждающих моделей в списке нет намеренно: такая молчит, пока думает,
+        # и первый токен приходит через десятки секунд — в чате это читается как
+        # «бот завис». Нужен ход мыслей — включайте его у конкретной модели, а не
+        # платите им за каждое «привет».
+        #
+        # Порядок важен вдвойне. Первый ключ — модель по умолчанию, а следующие
+        # за текущей уходят в запасные (_fallback_models берёт следующие
+        # MAX_FALLBACKS штук), поэтому сразу за super-120b стоят два самых
+        # быстрых варианта: подмена модели не должна оборачиваться ожиданием.
         "models": {
-            "glimmer-30b": "meta/muse-glimmer-30b",
             "super-120b": "nvidia/nemotron-3-super-120b-a12b",
-            "ultra-550b": "nvidia/nemotron-3-ultra-550b-a55b",
             "lightning-30b": "nvidia/nemotron-3.5-lightning-30b-a3b",
+            "ultra-550b": "nvidia/nemotron-3-ultra-550b-a55b",
             "inkling": "thinkingmachines/inkling",
             "minimax-m3": "minimaxai/minimax-m3",
             # Бот на ней и начинался (коммит 7d8616e), потом её сменили на Qwen.
             # Размышления у DeepSeek V4 включаются явно (chat_template_kwargs:
-            # thinking), то есть по умолчанию она отвечает сразу — для чата это
-            # ровно то, чего не хватает glimmer-30b.
+            # thinking), то есть по умолчанию она отвечает сразу.
             # Стоит последней намеренно: пока не проверена на текущем каталоге,
             # в запасные модели (_fallback_models берёт первые MAX_FALLBACKS)
             # она не попадает, но в /menu выбирается.
             "deepseek-flash": "deepseek-ai/deepseek-v4-flash-0731",
         },
-        "default": "glimmer-30b",
+        "default": "super-120b",
         # Размер контекста NVIDIA в API не сообщает (в /v1/models только id и
         # owner) и переполнение не отвергает. Значение измерено вручную: пять
-        # прежних моделей приняли промпт на 115k токенов, super-120b — на 360k;
-        # у glimmer-30b карточка заявляет 131k, замером не проверялось.
+        # моделей приняли промпт на 115k токенов, super-120b — на 360k.
         # Берём консервативные 128k как ориентир для индикатора.
         "context": 128000,
     },
 }
+
+# Один HTTP-клиент на весь процесс. Раньше каждое обращение к модели поднимало
+# свой httpx.AsyncClient: новое TCP-соединение и полное TLS-рукопожатие с
+# integrate.api.nvidia.com на КАЖДЫЙ запрос, а их на один детальный вопрос
+# уходит до восьми. Общий клиент держит соединения открытыми (keep-alive), и
+# рукопожатие платится один раз, а не перед каждым ответом.
+#
+# Таймаут в самом клиенте общий и заведомо щедрый: у стриминга и у маршрутного
+# вызова бюджеты разные, поэтому реальные значения приходят с каждым запросом.
+CONNECT_TIMEOUT = float(os.getenv("CONNECT_TIMEOUT", "5"))
+_HTTP_CLIENT: httpx.AsyncClient | None = None
+
+
+def http_client() -> httpx.AsyncClient:
+    """Общий клиент с пулом соединений. Создаётся лениво — внутри event loop."""
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None or _HTTP_CLIENT.is_closed:
+        _HTTP_CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0),
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20,
+                                keepalive_expiry=300.0),
+        )
+    return _HTTP_CLIENT
+
+
+async def close_http_client():
+    """Закрывает пул при остановке бота, чтобы не рвать соединения молча."""
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is not None and not _HTTP_CLIENT.is_closed:
+        await _HTTP_CLIENT.aclose()
+    _HTTP_CLIENT = None
+
+
+def request_timeout(read: float) -> httpx.Timeout:
+    """Таймауты по фазам запроса.
+
+    Одно число на всё смешивало разные вещи: зависший коннект держали столько
+    же, сколько живую генерацию. Соединение обязано устанавливаться быстро,
+    а ждать токенов от модели можно долго.
+    """
+    return httpx.Timeout(connect=CONNECT_TIMEOUT, read=read, write=15.0,
+                         pool=CONNECT_TIMEOUT)
+
 
 # Пользовательские настройки: chat_id -> {provider, model}
 DEFAULT_PROVIDER = "nvidia"
@@ -1076,29 +1140,6 @@ SMALL_TALK = {
 }
 
 
-# Muse Glimmer читает силу рассуждений из системного промпта — так написано в
-# карточке модели: «Reasoning strength: <low|medium|high|xhigh>», по умолчанию
-# high. Спецпараметра API для этого нет, поэтому строка идёт обычным system.
-#
-# Сил две, потому что вызова два. Маршрутный решает единственный вопрос —
-# «нужен ли интернет»; думать там нечего, а high стоит полного прохода
-# размышлений перед КАЖДЫМ сообщением. Ответу оставляем середину.
-REASONING_MODELS = {"meta/muse-glimmer-30b"}
-ROUTE_REASONING = os.getenv("ROUTE_REASONING", "low")
-ANSWER_REASONING = os.getenv("ANSWER_REASONING", "medium")
-
-
-def with_reasoning(messages: list[dict], model_id: str, strength: str) -> list[dict]:
-    """Добавляет системную строку с силой рассуждений, если модель её понимает.
-
-    Список не меняется на месте: research.run_tool_loop держит свою историю, и
-    строка не должна в ней накапливаться от круга к кругу.
-    """
-    if model_id not in REASONING_MODELS or not strength:
-        return messages
-    return [{"role": "system", "content": f"Reasoning strength: {strength}"}] + list(messages)
-
-
 def is_small_talk(text: str) -> bool:
     """True, если реплика целиком — приветствие или болтовня.
 
@@ -1383,15 +1424,15 @@ async def _stream_model(provider_key: str, model_id: str, messages: list[dict], 
     provider = PROVIDERS[provider_key]
     api_key = provider["api_key"]
     api_url = provider["api_url"]
-    
+
     if not api_key:
         raise ValueError(f"API key not set for {provider_key}")
-    
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    
+
     payload = {
         "model": model_id,
         "messages": messages,
@@ -1402,44 +1443,45 @@ async def _stream_model(provider_key: str, model_id: str, messages: list[dict], 
     if stream:
         # NVIDIA присылает usage в стриме только по явному запросу
         payload["stream_options"] = {"include_usage": True}
-    
+
     API_REQUESTS["n"] += 1
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        async with client.stream("POST", api_url, headers=headers, json=payload) as response:
-            if response.status_code in (429, 529, 503):
-                raise httpx.HTTPStatusError(f"Rate limited", request=response.request, response=response)
-            
-            if response.status_code != 200:
-                error_text = await response.aread()
-                logger.error(f"{provider['name']} API error {response.status_code}: {error_text}")
-                raise httpx.HTTPStatusError(f"API error: {response.status_code}", request=response.request, response=response)
-            
-            usage = {}
-            async for line in response.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
-                data = line[6:]
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
+    async with http_client().stream("POST", api_url, headers=headers, json=payload,
+                                    timeout=request_timeout(timeout)) as response:
+        if response.status_code in (429, 529, 503):
+            raise httpx.HTTPStatusError("Rate limited", request=response.request, response=response)
 
-                # Финальный чанк с usage приходит с пустым choices — читаем его до проверки
-                if chunk.get("usage"):
-                    usage = chunk["usage"]
+        if response.status_code != 200:
+            error_text = await response.aread()
+            logger.error(f"{provider['name']} API error {response.status_code}: {error_text}")
+            raise httpx.HTTPStatusError(f"API error: {response.status_code}",
+                                        request=response.request, response=response)
 
-                choices = chunk.get("choices") or []
-                if not choices:
-                    continue
-                content = choices[0].get("delta", {}).get("content", "")
-                if content:
-                    yield content, usage
+        usage = {}
+        async for line in response.aiter_lines():
+            if not line.startswith("data: "):
+                continue
+            data = line[6:]
+            if data == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data)
+            except json.JSONDecodeError:
+                continue
 
-            # usage приезжает после последнего текстового чанка, поэтому отдаём его отдельно
-            if usage:
-                yield "", usage
+            # Финальный чанк с usage приходит с пустым choices — читаем его до проверки
+            if chunk.get("usage"):
+                usage = chunk["usage"]
+
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            content = choices[0].get("delta", {}).get("content", "")
+            if content:
+                yield content, usage
+
+        # usage приезжает после последнего текстового чанка, поэтому отдаём его отдельно
+        if usage:
+            yield "", usage
 
 
 
@@ -1518,17 +1560,20 @@ async def _call_model_once(provider_key: str, model_id: str, messages: list[dict
         "Content-Type": "application/json",
     }
     API_REQUESTS["n"] += 1
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(provider["api_url"], headers=headers, json=payload)
-        if response.status_code != 200:
-            logger.error(f"{provider['name']} API error {response.status_code}: {response.text[:300]}")
-            raise httpx.HTTPStatusError(
-                f"API error: {response.status_code}", request=response.request, response=response
-            )
-        return response.json()["choices"][0]["message"]
+    response = await http_client().post(provider["api_url"], headers=headers, json=payload,
+                                        timeout=request_timeout(timeout))
+    if response.status_code != 200:
+        logger.error(f"{provider['name']} API error {response.status_code}: {response.text[:300]}")
+        raise httpx.HTTPStatusError(
+            f"API error: {response.status_code}", request=response.request, response=response
+        )
+    return response.json()["choices"][0]["message"]
 
 RETRY_STATUSES = (429, 500, 502, 503, 529)
-RETRY_DELAYS = (2, 6)  # паузы перед повторами одной и той же модели, секунды
+# Паузы перед повторами одной и той же модели, секунды. Короткие: на 429
+# провайдер сам присылает Retry-After и он важнее, а остальные коды — это
+# мгновенная неудача, ждать шесть секунд там не за чем.
+RETRY_DELAYS = (1, 4)
 MAX_FALLBACKS = 2      # сколько запасных моделей пробовать, чтобы не ждать вечно
 
 # Потолок на ВСЕ попытки одного запроса. Без него повторы перемножались:
@@ -1536,13 +1581,19 @@ MAX_FALLBACKS = 2      # сколько запасных моделей проб
 # секунд молчания в чат. Пользователь столько не ждёт, ему нужен ответ или
 # честная ошибка. Таймаут каждой попытки дополнительно урезается остатком
 # бюджета, иначе последняя попытка перепрыгнула бы дедлайн.
-TOTAL_DEADLINE = float(os.getenv("TOTAL_DEADLINE", "180"))
-# Рассуждающая модель молчит, пока думает: до первого видимого токена может
-# пройти сильно больше прежних 60с, и попытка «протухала» на живой модели.
-STREAM_TIMEOUT = float(os.getenv("STREAM_TIMEOUT", "150"))
-ROUTE_TIMEOUT = float(os.getenv("ROUTE_TIMEOUT", "60"))
+TOTAL_DEADLINE = float(os.getenv("TOTAL_DEADLINE", "120"))
+# Пауза МЕЖДУ порциями потока, а не на весь ответ: httpx считает read-таймаут
+# заново с каждым куском. Модель по умолчанию отдаёт первый токен за секунды,
+# так что молчание длиной в минуту — это уже зависшая попытка, и честнее
+# оборвать её и повторить, чем сидеть в ней две с половиной минуты, как
+# приходилось с рассуждающей моделью.
+STREAM_TIMEOUT = float(os.getenv("STREAM_TIMEOUT", "60"))
+ROUTE_TIMEOUT = float(os.getenv("ROUTE_TIMEOUT", "30"))
 # Потолок на весь цикл поиска: кругов до MAX_ROUNDS, у каждого свой дедлайн.
-RESEARCH_BUDGET = float(os.getenv("RESEARCH_BUDGET", "240"))
+RESEARCH_BUDGET = float(os.getenv("RESEARCH_BUDGET", "150"))
+# Как часто подкручивать заглушку с таймером и предпросмотром ответа. Чаще
+# нельзя: Telegram включает флуд-контроль на правках одного сообщения.
+PREVIEW_INTERVAL = 1.5
 
 
 def _now() -> float:
@@ -1603,14 +1654,18 @@ async def call_provider_api(provider_key: str, model_id: str, messages: list[dic
                 raise last_error or TimeoutError(f"Модель не ответила за {TOTAL_DEADLINE:.0f}с")
             started = False
             try:
-                async for token, usage in _stream_model(provider_key, candidate, messages,
-                                                        stream=stream, temperature=temperature,
-                                                        timeout=min(STREAM_TIMEOUT, remaining)):
-                    if not started:
-                        started = True
-                        if position > 0 and on_fallback:
-                            await on_fallback(candidate)
-                    yield token, usage
+                # aclosing: при ошибке или отмене генератор закрывается сразу, и
+                # соединение возвращается в общий пул, а не ждёт сборщика мусора.
+                stream_iter = _stream_model(provider_key, candidate, messages,
+                                            stream=stream, temperature=temperature,
+                                            timeout=min(STREAM_TIMEOUT, remaining))
+                async with contextlib.aclosing(stream_iter):
+                    async for token, usage in stream_iter:
+                        if not started:
+                            started = True
+                            if position > 0 and on_fallback:
+                                await on_fallback(candidate)
+                        yield token, usage
                 return
             except httpx.HTTPError as e:
                 if started:
@@ -1733,26 +1788,26 @@ async def context_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.chat.type not in ("group", "supergroup"):
         await update.message.reply_text(f"{emoji('warning')} Команда работает только в группах")
         return
-    
+
     chat_id = update.message.chat_id
     messages = CHAT_MESSAGES.get(chat_id, [])
     if not messages:
         await update.message.reply_text(f"{emoji('warning')} Нет сохранённых сообщений")
         return
-    
+
     n = 20
     if context.args:
         try:
             n = max(1, min(50, int(context.args[0])))
         except ValueError:
             pass
-    
+
     recent = messages[-n:]
     lines = [f"{emoji('code')} <b>Последние {len(recent)} сообщений:</b>\n"]
     for msg in recent:
         time_str = msg["time"][11:16]
         lines.append(f"<code>{time_str}</code> <b>{msg['user_name']}</b>: {msg['text'][:200]}")
-    
+
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
@@ -1761,39 +1816,39 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.chat.type not in ("group", "supergroup"):
         await update.message.reply_text(f"{emoji('warning')} Команда работает только в группах")
         return
-    
+
     chat_id = update.message.chat_id
     messages = CHAT_MESSAGES.get(chat_id, [])
     if not messages:
         await update.message.reply_text(f"{emoji('warning')} Нет сохранённых сообщений для резюме")
         return
-    
+
     n = 30
     if context.args:
         try:
             n = max(1, min(50, int(context.args[0])))
         except ValueError:
             pass
-    
+
     recent = messages[-n:]
     dialog = "\n".join([f"{msg['user_name']}: {msg['text']}" for msg in recent])
-    
+
     provider_key, model_id = get_current_model(update.message.chat_id)
-    
+
     prompt = (
         f"Сделай краткое резюме диалога на русском языке. "
         f"Выдели главные темы, споры, решения. Формат: кратко, по пунктам, без воды.\n\n"
         f"Диалог:\n{dialog}"
     )
-    
+
     thinking = await update.message.reply_text(f"{emoji('thinking')} <b>Анализирую чат...</b>", parse_mode=ParseMode.HTML)
-    
+
     try:
         summary_parts = []
         async for token, _ in call_provider_api(provider_key, model_id, [{"role": "user", "content": prompt}]):
             summary_parts.append(token)
         summary = "".join(summary_parts).strip()
-        
+
         await thinking.edit_text(
             f"{emoji('brain')} <b>Резюме последних {len(recent)} сообщений:</b>\n\n"
             f"{md_to_html(summary)}",
@@ -1808,34 +1863,34 @@ async def judge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.chat.type not in ("group", "supergroup"):
         await update.message.reply_text(f"{emoji('warning')} Команда работает только в группах")
         return
-    
+
     chat_id = update.message.chat_id
     messages = CHAT_MESSAGES.get(chat_id, [])
     if not messages:
         await update.message.reply_text(f"{emoji('warning')} Нет сохранённых сообщений")
         return
-    
+
     question = " ".join(context.args) if context.args else "Кто прав в этом споре? Дай объективное мнение."
-    
+
     recent = messages[-20:]
     dialog = "\n".join([f"{msg['user_name']}: {msg['text']}" for msg in recent])
-    
+
     provider_key, model_id = get_current_model(chat_id)
-    
+
     prompt = (
         f"Проанализируй диалог и дай объективное мнение по вопросу: {question}\n"
         f"Будь беспристрастным, опирайся только на факты из чата. Ответ на русском, кратко.\n\n"
         f"Контекст:\n{dialog}"
     )
-    
+
     thinking = await update.message.reply_text(f"{emoji('brain')} <b>Анализирую спор...</b>", parse_mode=ParseMode.HTML)
-    
+
     try:
         opinion_parts = []
         async for token, _ in call_provider_api(provider_key, model_id, [{"role": "user", "content": prompt}]):
             opinion_parts.append(token)
         opinion = "".join(opinion_parts).strip()
-        
+
         await thinking.edit_text(
             f"{emoji('brain')} <b>Мнение по спору:</b>\n\n"
             f"{md_to_html(opinion)}",
@@ -1874,9 +1929,9 @@ async def code_help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
         return
-    
+
     action = context.args[0] if context.args else "explain"
-    
+
     # Получаем код: из аргументов команды или из реплая
     if len(context.args) > 1:
         code = " ".join(context.args[1:])
@@ -1888,7 +1943,7 @@ async def code_help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
         return
-    
+
     await _run_code_help(update.message.chat_id, context, action, code)
 
 
@@ -2372,7 +2427,7 @@ async def _run_poll(chat_id: int, context: ContextTypes.DEFAULT_TYPE, poll_type:
 async def _run_code_help(chat_id: int, context: ContextTypes.DEFAULT_TYPE, action: str, code: str = None):
     """Внутренняя функция для помощи с кодом."""
     provider_key, model_id = get_current_model(chat_id)
-    
+
     actions = {
         "review": "Сделай code review: найди баги, проблемы стиля, проблемы безопасности, предложи улучшения",
         "explain": "Объясни что делает этот код, пошагово, простым языком",
@@ -2380,22 +2435,22 @@ async def _run_code_help(chat_id: int, context: ContextTypes.DEFAULT_TYPE, actio
         "optimize": "Оптимизируй код: производительность, память, читаемость",
         "write": "Напиши код по описанию",
     }
-    
+
     prompt = (
         f"{actions.get(action, actions['explain'])}.\n\n"
         f"Код:\n```\n{code}\n```\n\n"
         f"Ответ на русском, используй markdown для кода."
     )
-    
+
     bot = _bot()
     msg = await bot.send_message(chat_id, f"{emoji('code')} <b>Анализирую код...</b>", parse_mode=ParseMode.HTML)
-    
+
     try:
         parts = []
         async for token, _ in call_provider_api(provider_key, model_id, [{"role": "user", "content": prompt}]):
             parts.append(token)
         result = "".join(parts).strip()
-        
+
         await bot.edit_message_text(
             chat_id=chat_id,
             message_id=msg.message_id,
@@ -2414,7 +2469,7 @@ async def _run_task(chat_id: int, context: ContextTypes.DEFAULT_TYPE, difficulty
     """Внутренняя функция для генерации задачи. Если передан level (из roadmap),
     задача привязывается к конкретному стеку/языкам уровня и сохраняется для экспорта."""
     provider_key, model_id = get_current_model(chat_id)
-    
+
     difficulties = {
         "easy": "Junior уровень: базовые алгоритмы, массивы, строки, циклы",
         "medium": "Middle уровень: структуры данных, DP, графы, алгоритмы сортировки",
@@ -2432,7 +2487,7 @@ async def _run_task(chat_id: int, context: ContextTypes.DEFAULT_TYPE, difficulty
         if langs:
             lang_note = (f"\nЗадача обязательно должна решаться на одном из этих языков: {', '.join(langs)}. "
                          f"Выбери конкретный язык из списка и укажи его. Решение пиши именно на этом языке.")
-    
+
     prompt = (
         f"Создай задачу по программированию уровня: {difficulties.get(difficulty, difficulties['medium'])}."
         f"{stack_note}"
@@ -2445,10 +2500,10 @@ async def _run_task(chat_id: int, context: ContextTypes.DEFAULT_TYPE, difficulty
         f"5. Решение на выбранном языке с комментариями\n\n"
         f"На русском языке."
     )
-    
+
     bot = _bot()
     msg = await bot.send_message(chat_id, f"{emoji('brain')} <b>Генерирую задачу...</b>", parse_mode=ParseMode.HTML)
-    
+
     try:
         parts = []
         async for token, _ in call_provider_api(provider_key, model_id, [{"role": "user", "content": prompt}]):
@@ -2481,7 +2536,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     model_key = settings.get("model", PROVIDERS[provider_key]["default"])
     provider_name = PROVIDERS[provider_key]["name"]
     model_name = model_key
-    
+
     text = (
         f"{emoji('gear')} <b>Настройки модели</b>\n\n"
         f"Текущий провайдер: <b>{provider_name}</b>\n"
@@ -2496,11 +2551,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     chat_id = query.message.chat_id
     data = query.data
-    
+
     # Быстрые переходы меню — отвечаем сразу
     if data in ("main_menu", "models_menu", "quiz_menu", "poll_menu", "code_help", "code_tasks", "roadmap_menu", "stack_menu"):
         await query.answer()
-    
+
     if data == "main_menu":
         await query.edit_message_text(
             f"{emoji('gear')} <b>Настройки модели</b>\n\nВыберите провайдера:",
@@ -2727,17 +2782,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     provider_key, model_id = get_current_model(chat_id)
     provider_name = PROVIDERS[provider_key]["name"]
 
-    # Строим сообщения с историей
-    messages = []
-    for h in history:
-        messages.append({"role": "user", "content": h["user"]})
-        messages.append({"role": "assistant", "content": h["assistant"]})
+    # Строим сообщения с историей (старые ответы бота — обрезанными)
+    messages = history_messages(history)
     messages.append({"role": "user", "content": f"Сегодня {datetime.now().strftime('%d.%m.%Y')}. На вопросы по теории, коду, математике и общим знаниям отвечай сам, без поиска. В интернет иди только если ответ зависит от текущего момента — новости, цены, последние версии, даты; тогда опирайся на найденное, а не на память. ТЫ ОБЯЗАН ОТВЕЧАТЬ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ. ЗАПРЕЩЕНО ИСПОЛЬЗОВАТЬ HTML-ТЕГИ (<hr>, <strong>, <b>, <ol>, <ul>, <li>, <h1>, <h2>, <h3>, <p>, <div>, <span> И ДРУГИЕ). ИСПОЛЬЗУЙ ТОЛЬКО MARKDOWN: **жирный**, *курсив*, `код`, ```блоки кода```, - списки, 1. нумерованные списки, > цитаты. ОТВЕЧАЙ СРАЗУ И ЧЁТКО, БЕЗ РАССУЖДЕНИЙ. СТРУКТУРИРУЙ ОТВЕТ: короткое вступление, затем разделы/списки/код. ЕСЛИ ЗАДАЛИ ВОПРОС (о викторине, коде или чём угодно) — ОТВЕЧАЙ ПРЯМО НА НЕГО. ВОПРОС: {user_text}"})
 
     calls_at_start = API_REQUESTS["n"]
     all_parts = []
     first_token_at = None   # время до первого видимого токена — главная метрика
-    last_edit_len = 0
     start_time = asyncio.get_event_loop().time()
     usage = {}
 
@@ -2779,10 +2830,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await render_progress()
 
         async def llm_call(msgs, tools):
-            # На маршрутном вызове думать нечего — вопрос бинарный.
-            return await call_provider_api_once(
-                provider_key, model_id,
-                with_reasoning(msgs, model_id, ROUTE_REASONING), tools=tools)
+            return await call_provider_api_once(provider_key, model_id, msgs, tools=tools)
 
         research_started = _now()
         try:
@@ -2838,30 +2886,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                       if sources else "")
             await render_progress(footer)
 
-    # Фоновая задача для обновления таймера каждые 2 секунды
+    # Заглушку правит ТОЛЬКО эта фоновая задача — таймер и предпросмотр разом.
+    # Раньше её правил ещё и цикл чтения токенов, каждые 300 символов, и на
+    # время правки (запрос в Telegram и ответ от него) переставал вычитывать
+    # поток: ответ печатался медленнее, чем модель его отдавала.
     stop_timer = asyncio.Event()
-    last_timer_text = ""
-    edit_lock = asyncio.Lock()  # Защита от race condition при edit_text
 
     async def timer_updater():
-        nonlocal last_timer_text
-        while not stop_timer.is_set():
-            await asyncio.sleep(2)
-            if stop_timer.is_set():
-                break
-            elapsed = int(asyncio.get_event_loop().time() - start_time)
-            preview = "".join(all_parts)[-2500:] if all_parts else ""
+        last_timer_text = ""
+        while True:
+            try:
+                # Не sleep: по готовности ответа задача обязана проснуться
+                # немедленно. На sleep(2) финальное сообщение ждало конца сна —
+                # до двух лишних секунд молчания на КАЖДОМ ответе.
+                await asyncio.wait_for(stop_timer.wait(), timeout=PREVIEW_INTERVAL)
+                return
+            except asyncio.TimeoutError:
+                pass
+            elapsed = int(_now() - start_time)
+            preview = "".join(all_parts)[-2500:]
             timer_text = (
                 f"{emoji('thinking')} <b>Пишу ответ...</b> ⏱ <i>{elapsed}с</i> ({provider_name})\n\n"
                 f"<blockquote expandable>{preview}</blockquote>"
             )
-            if timer_text != last_timer_text:
-                async with edit_lock:
-                    try:
-                        await thinking_msg.edit_text(timer_text, parse_mode=ParseMode.HTML)
-                        last_timer_text = timer_text
-                    except Exception:
-                        pass
+            if timer_text == last_timer_text:
+                continue
+            try:
+                await thinking_msg.edit_text(timer_text, parse_mode=ParseMode.HTML)
+                last_timer_text = timer_text
+            except Exception:
+                pass
 
     timer_task = asyncio.create_task(timer_updater())
 
@@ -2873,43 +2927,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         nonlocal fallback_model
         fallback_model = model
 
+    # Цикл только вычитывает поток и копит куски: показывает их пользователю
+    # timer_updater. Любое ожидание здесь — это пауза в чтении сокета.
     try:
-        async for token, u in call_provider_api(provider_key, model_id,
-                                                with_reasoning(messages, model_id, ANSWER_REASONING),
+        async for token, u in call_provider_api(provider_key, model_id, messages,
                                                 on_fallback=note_fallback):
             if token and first_token_at is None:
-                # Рассуждающая модель молчит, пока думает: этот интервал и есть
-                # «бот завис». Отделяем его от скорости самой генерации.
+                # Пока модель не отдала первый токен, в чате «бот завис».
+                # Отделяем этот интервал от скорости самой генерации.
                 first_token_at = _now() - start_time
-            all_parts.append(token)
-            full_text = "".join(all_parts)
+            if token:
+                all_parts.append(token)
             if u:
                 usage = u
-
-            # Обновляем каждые ~300 символов (плюс таймер обновляется отдельно)
-            elapsed = int(asyncio.get_event_loop().time() - start_time)
-            if len(full_text) - last_edit_len >= 300:
-                last_edit_len = len(full_text)
-                preview = full_text[-2500:]
-                async with edit_lock:
-                    try:
-                        await thinking_msg.edit_text(
-                            f"{emoji('thinking')} <b>Пишу ответ...</b> ⏱ <i>{elapsed}с</i> ({provider_name})\n\n"
-                            f"<blockquote expandable>{preview}</blockquote>",
-                            parse_mode=ParseMode.HTML
-                        )
-                    except Exception:
-                        pass
     except Exception as e:
         logger.error(f"API call failed: {e}")
+        # Сначала гасим таймер, потом пишем ошибку: иначе фоновая задача успеет
+        # затереть её очередным предпросмотром.
+        stop_timer.set()
+        await timer_task
         await thinking_msg.edit_text(
             f"{emoji('error')} <b>Ошибка API</b>\n\n"
             f"<code>{str(e)[:500]}</code>\n\n"
             f"Попробуйте позже или смените модель через /menu.",
             parse_mode=ParseMode.HTML
         )
-        stop_timer.set()
-        await timer_task
         return
     finally:
         stop_timer.set()
@@ -3066,7 +3108,14 @@ def main():
             BotCommand("export", "📤 Экспорт tasks/вопросов в .md для Obsidian"),
         ])
 
+    async def post_shutdown(app):
+        # Общие пулы соединений живут весь процесс — закрываем их явно,
+        # иначе httpx ругается на брошенные сокеты при остановке.
+        await close_http_client()
+        await research.close_client()
+
     app.post_init = post_init
+    app.post_shutdown = post_shutdown
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear_history))
     app.add_handler(CommandHandler("menu", menu_command))

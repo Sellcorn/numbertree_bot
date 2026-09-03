@@ -27,13 +27,39 @@ logger = logging.getLogger(__name__)
 
 TAVILY_URL = "https://api.tavily.com/search"
 
-MAX_ROUNDS = 6               # кругов «подумал → поискал»
+MAX_ROUNDS = 4               # кругов «подумал → поискал»
 MAX_QUERIES = 5              # формулировок за один вызов инструмента
 MAX_RESULTS = 6              # источников на одну формулировку
 MAX_CHARS_PER_SOURCE = 1500  # обрезка выжимки одного источника
 MAX_CHARS_TOTAL = 14000      # потолок текста поиска на один круг
 MAX_IMAGES = 6              # картинок в каталоге для модели
 SEARCH_TIMEOUT = 30.0
+
+# Один клиент на процесс. За круг поиска уходит до пяти параллельных запросов
+# к одному и тому же хосту, кругов бывает несколько — поднимать под каждый своё
+# TLS-соединение значит платить рукопожатием за каждый запрос. Пул держит их
+# открытыми между кругами и между сообщениями.
+_CLIENT: httpx.AsyncClient | None = None
+
+
+def client() -> httpx.AsyncClient:
+    """Общий клиент. Создаётся лениво — уже внутри работающего event loop."""
+    global _CLIENT
+    if _CLIENT is None or _CLIENT.is_closed:
+        _CLIENT = httpx.AsyncClient(
+            timeout=SEARCH_TIMEOUT,
+            limits=httpx.Limits(max_keepalive_connections=10, max_connections=20,
+                                keepalive_expiry=300.0),
+        )
+    return _CLIENT
+
+
+async def close_client():
+    """Закрывает пул при остановке бота."""
+    global _CLIENT
+    if _CLIENT is not None and not _CLIENT.is_closed:
+        await _CLIENT.aclose()
+    _CLIENT = None
 
 TOOLS = [
     {
@@ -117,12 +143,11 @@ async def search(query: str, max_results: int = MAX_RESULTS) -> tuple[list[dict]
         "include_images": True,
         "include_image_descriptions": True,
     }
-    async with httpx.AsyncClient(timeout=SEARCH_TIMEOUT) as client:
-        response = await client.post(
-            TAVILY_URL, headers={"Authorization": f"Bearer {key}"}, json=payload
-        )
-        response.raise_for_status()
-        data = response.json()
+    response = await client().post(
+        TAVILY_URL, headers={"Authorization": f"Bearer {key}"}, json=payload
+    )
+    response.raise_for_status()
+    data = response.json()
 
     results = []
     for item in data.get("results", []):
