@@ -115,6 +115,11 @@ PROVIDERS = {
             "muse-spark-full": "meta/muse-spark-1.3",
         },
         "default": "muse-spark",
+        # Старшая Muse скрыта вместе с NVIDIA: в меню нужна только та, что
+        # работает по тарифу contributor. Скрытая модель не подставляется и
+        # запасной — иначе «показываем одну» означало бы «отвечаем другой»,
+        # причём вдвадцатеро дороже.
+        "hidden_models": ("muse-spark-full",),
         # Заявленное окно, оно же предел эндпоинта. В отличие от NVIDIA гадать
         # не пришлось: OpenRouter отдаёт размер в /api/v1/models.
         "context": 1048576,
@@ -124,6 +129,10 @@ PROVIDERS = {
     },
     "nvidia": {
         "name": "NVIDIA",
+        # Скрыт временно: сейчас в меню нужна только Muse. Блок оставлен целиком
+        # — на нём висят замеры скорости, регрессии и запасные модели, и вернуть
+        # провайдера надо снятием одной строки, а не восстановлением удалённого.
+        "hidden": True,
         "api_key": os.getenv("NVIDIA_API_KEY"),
         "api_url": f"{NVIDIA_API_BASE}/chat/completions",
         # Скорость замерена одним промптом в одном окне (ток/с, первый токен):
@@ -210,6 +219,18 @@ def request_timeout(read: float) -> httpx.Timeout:
 
 # Пользовательские настройки: chat_id -> {provider, model}
 DEFAULT_PROVIDER = "openrouter"
+
+
+def visible_providers() -> dict:
+    """Провайдеры, доступные пользователю в /menu."""
+    return {k: v for k, v in PROVIDERS.items() if not v.get("hidden")}
+
+
+def visible_models(provider_key: str) -> dict:
+    """Модели провайдера, доступные пользователю."""
+    provider = PROVIDERS[provider_key]
+    hidden = provider.get("hidden_models") or ()
+    return {k: v for k, v in provider["models"].items() if k not in hidden}
 
 # ============ ROADMAP (конфигурация уровней и стека) ============
 # Читается из roadmap.json рядом с ботом. Содержит:
@@ -1214,11 +1235,14 @@ def get_user_settings(chat_id: int) -> dict:
     модель, убранная из меню) молча заменяются на дефолтные.
     """
     stored = _peek_user_settings(chat_id)
+    # Сверяемся с ВИДИМЫМ списком: у чатов, где был выбран скрытый теперь
+    # провайдер, выбор молча переезжает на дефолтный. Иначе «спрятали из меню»
+    # значило бы «спрятали от новых, а старые как отвечали, так и отвечают».
     provider = stored.get("provider")
-    if provider not in PROVIDERS:
+    if provider not in visible_providers():
         provider = DEFAULT_PROVIDER
     model = stored.get("model")
-    if model not in PROVIDERS[provider]["models"]:
+    if model not in visible_models(provider):
         model = PROVIDERS[provider]["default"]
     return {"provider": provider, "model": model}
 
@@ -1256,7 +1280,7 @@ def build_main_menu(chat_id: int):
     current = settings.get("provider", DEFAULT_PROVIDER)
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     buttons = []
-    for key, prov in PROVIDERS.items():
+    for key, prov in visible_providers().items():
         label = f"{'✅ ' if key == current else ''}{prov['name']}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"provider:{key}")])
     buttons.append([InlineKeyboardButton("🔧 Модели текущего провайдера", callback_data="models_menu")])
@@ -1281,7 +1305,7 @@ def build_models_menu(chat_id: int):
     current_model = settings.get("model", provider["default"])
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     buttons = []
-    for model_key, model_id in provider["models"].items():
+    for model_key, model_id in visible_models(provider_key).items():
         label = f"{'✅ ' if model_key == current_model else ''}{model_key}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"model:{model_key}")])
     buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="main_menu")])
@@ -1681,7 +1705,7 @@ API_REQUESTS = {"n": 0}
 
 def _fallback_models(provider_key: str, model_id: str) -> list[str]:
     """Текущая модель, затем несколько запасных из меню того же провайдера."""
-    others = [m for m in PROVIDERS[provider_key]["models"].values() if m != model_id]
+    others = [m for m in visible_models(provider_key).values() if m != model_id]
     return [model_id] + others[:MAX_FALLBACKS]
 
 
@@ -2641,7 +2665,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     elif data.startswith("provider:"):
         provider_key = data.split(":")[1]
-        if provider_key in PROVIDERS:
+        if provider_key in visible_providers():
             await set_user_provider(chat_id, provider_key)
             provider_name = PROVIDERS[provider_key]["name"]
             await query.answer()
@@ -2655,7 +2679,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         settings = get_user_settings(chat_id)
         provider_key = settings.get("provider", DEFAULT_PROVIDER)
         # Проверяем что модель существует у текущего провайдера
-        if model_key in PROVIDERS[provider_key]["models"]:
+        if model_key in visible_models(provider_key):
             await set_user_model(chat_id, model_key)
             await query.answer()
             await query.edit_message_text(

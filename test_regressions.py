@@ -336,9 +336,35 @@ check("дефолт — Muse Spark Contributor",
 check_true("глубина размышлений быстрая",
            _or["extra_payload"]["reasoning"]["effort"] in ("minimal", "low"),
            str(_or["extra_payload"]))
-check("запасная — та же Muse без тарифа contributor",
-      main._fallback_models("openrouter", "meta/muse-spark-1.3-contributor")[1:],
-      ["meta/muse-spark-1.3"])
+
+
+# ---------- в меню только Muse contributor ----------
+# NVIDIA и старшая Muse временно скрыты. Скрытое обязано пропасть отовсюду, а не
+# только с кнопок: и из запасных моделей, и из уже сохранённого выбора. Иначе
+# «в меню одна модель» прекрасно уживается с «а отвечает другая».
+check("в меню один провайдер", list(main.visible_providers()), ["openrouter"])
+check("в меню одна модель", list(main.visible_models("openrouter")), ["muse-spark"])
+check_true("nvidia не удалён, только скрыт",
+           "nvidia" in main.PROVIDERS and main.PROVIDERS["nvidia"].get("hidden"))
+# Запасных нет намеренно: подставить скрытую значило бы молча уехать на тариф
+# в 12-20 раз дороже. Пока видимая модель одна, ответ либо приходит от неё,
+# либо не приходит вовсе — повторы у неё же остаются.
+check("запасных нет, пока модель одна",
+      main._fallback_models("openrouter", "meta/muse-spark-1.3-contributor"),
+      ["meta/muse-spark-1.3-contributor"])
+
+# Чат, где до скрытия был выбран NVIDIA, обязан переехать на дефолт: настройки
+# лежат в progress.json и переживают перезапуск.
+main.USER_CONFIG["4242"] = {"provider": "nvidia", "model": "super-120b"}
+try:
+    _moved = main.get_user_settings(4242)
+    check("старый выбор nvidia переехал на дефолт", _moved["provider"], "openrouter")
+    check("и модель тоже", _moved["model"], "muse-spark")
+    main.USER_CONFIG["4242"] = {"provider": "openrouter", "model": "muse-spark-full"}
+    check("скрытая модель из настроек не берётся",
+          main.get_user_settings(4242)["model"], "muse-spark")
+finally:
+    main.USER_CONFIG.pop("4242", None)
 
 # Глубина обязана доезжать до провайдера в ОБОИХ вызовах: маршрутный «нужен ли
 # поиск» молчит, пока модель думает, точно так же.
@@ -451,7 +477,7 @@ check_true("предпросмотр не показан, пока нет ток
            all("blockquote" not in t for t in _ticks))
 
 
-total = 45
+total = 51
 if failures:
     print(f"ПРОВАЛЕНО {len(failures)}:")
     print("\n".join(failures))
